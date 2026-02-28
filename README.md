@@ -4,6 +4,7 @@ Code and results for: **"Cross-District Electoral Forecasting via Graph Neural N
 
 ## Repository Structure
 
+```
 code/
    ├── Python/
    │    └── Graph Structure Ablation Study.ipynb
@@ -12,3 +13,4 @@ code/
    │    └── comparison results.Rmd
    │    └── First version before reviewing.Rmd
    │    └── Improved plots.Rmd
+```
