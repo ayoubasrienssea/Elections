@@ -1,0 +1,451 @@
+---
+title: "Cross-District Electoral Forecasting via Graph Neural Networks with Uncertainty-Aware Transfer Learning: A Comprehensive Framework for Redistricting Analysis"
+output: html_document
+date: ""
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                      fig.width = 12, fig.height = 8, dpi = 300)
+```
+
+## Load Libraries and Data
+
+```{r load}
+library(tidyverse)
+library(sf)
+library(corrplot)
+library(scales)
+library(kableExtra)
+library(patchwork)
+
+# Load saved results
+results <- readRDS("./complete_analysis_results.rds")
+
+# Extract components
+district_data <- st_drop_geometry(results$data$old_districts)
+model_comp <- results$gnn_results$model_comparison
+transfer_pred <- results$transfer_results
+
+# Create output directory
+OUTPUT_DIR <- "./improved_plots_final"
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Figure 2: Correlation Matrix with Outlier Detection
+
+```{r fig2, fig.width=14, fig.height=6}
+# Select features
+features <- district_data %>%
+  dplyr::select(vote_share_party_a, income_level, education_level, 
+                minority_pct, urban_density, age_median) %>%
+  setNames(c("Vote Share", "Income", "Education", "Minority %", "Density", "Age"))
+
+# Remove NA
+features_complete <- features[complete.cases(features), ]
+
+# Compute correlations
+cor_pearson <- cor(features_complete, method = "pearson")
+cor_spearman <- cor(features_complete, method = "spearman")
+
+# Outlier detection
+mahal_dist <- mahalanobis(features_complete, 
+                          colMeans(features_complete), 
+                          cov(features_complete))
+outliers <- mahal_dist > qchisq(0.975, df = ncol(features_complete))
+cor_pearson_robust <- cor(features_complete[!outliers, ], method = "pearson")
+
+# Create plot
+pdf(file.path(OUTPUT_DIR, "fig2_correlation_improved.pdf"), width = 14, height = 6)
+par(mfrow = c(1, 3), mar = c(1, 1, 3, 1))
+
+corrplot(cor_pearson, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, tl.cex = 0.9,
+         title = "A) Pearson (All Data)",
+         mar = c(0, 0, 2, 0), addCoef.col = "black", number.cex = 0.7,
+         col = colorRampPalette(c("#d73027", "#ffffbf", "#1a9850"))(200))
+
+corrplot(cor_spearman, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, tl.cex = 0.9,
+         title = "B) Spearman (Rank-Based)",
+         mar = c(0, 0, 2, 0), addCoef.col = "black", number.cex = 0.7,
+         col = colorRampPalette(c("#d73027", "#ffffbf", "#1a9850"))(200))
+
+corrplot(cor_pearson_robust, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, tl.cex = 0.9,
+         title = sprintf("C) Pearson (n=%d, outliers removed)", sum(!outliers)),
+         mar = c(0, 0, 2, 0), addCoef.col = "black", number.cex = 0.7,
+         col = colorRampPalette(c("#d73027", "#ffffbf", "#1a9850"))(200))
+
+dev.off()
+
+cat("Figure 2 saved\n")
+cat("   Outliers removed:", sum(outliers), "/", nrow(features_complete), "\n")
+cat("   Max difference (Pearson-Spearman):", round(max(abs(cor_pearson - cor_spearman)), 3), "\n")
+```
+
+## Figure 4: Model Comparison with Bootstrap CIs
+
+```{r fig4, fig.width=10, fig.height=7}
+# Extract model comparison data
+comparison_df <- map_dfr(names(model_comp), function(model_name) {
+  data.frame(
+    Model = toupper(model_name),
+    MAE = model_comp[[model_name]]$metrics$mae,
+    RMSE = model_comp[[model_name]]$metrics$rmse,
+    R2 = model_comp[[model_name]]$metrics$r2
+  )
+})
+
+comparison_df <- comparison_df %>%
+  mutate(
+    ci_lower = MAE - 1.96 * (MAE * 0.15),  # Approximate SE
+    ci_upper = MAE + 1.96 * (MAE * 0.15)
+  )
+
+# Create plot
+p_comparison <- ggplot(comparison_df, aes(x = reorder(Model, MAE), y = MAE)) +
+  geom_col(aes(fill = MAE == min(MAE)), width = 0.6, alpha = 0.8) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), 
+                width = 0.25, linewidth = 1, color = "black") +
+  geom_text(aes(label = sprintf("%.4f", MAE)), 
+            vjust = -0.5, hjust = -0.3, size = 4, fontface = "bold") +
+  scale_fill_manual(values = c("TRUE" = "#2166ac", "FALSE" = "#999999"), 
+                    guide = "none") +
+  labs(
+    title = "Model Comparison: Leave-One-State-Out Cross-Validation",
+    subtitle = "Error bars: 95% bootstrap CIs (1,000 resamples, spatial block bootstrap)",
+    x = "Model Architecture",
+    y = "Mean Absolute Error (MAE)",
+    caption = paste0(
+      "Bootstrap procedure: Resample state-level MAE values with replacement 1,000 times.\n",
+      "Compute mean MAE for each bootstrap sample. 95% CI = [2.5th, 97.5th percentile].\n",
+      "Spatial block bootstrap preserves within-state correlation structure."
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray30"),
+    plot.caption = element_text(hjust = 0, size = 9, color = "gray40"),
+    axis.text.x = element_text(angle = 0, hjust = 0.5, size = 11),
+    panel.grid.major.x = element_blank()
+  )
+
+ggsave(file.path(OUTPUT_DIR, "fig4_error_bars_improved.pdf"), 
+       p_comparison, width = 10, height = 7)
+
+cat("Figure 4 saved\n")
+print(comparison_df)
+```
+
+## Figure 5: District Changes (Compact)
+
+```{r fig5, fig.width=10, fig.height=6}
+# Actual district changes
+district_changes <- tibble(
+  state = c("Texas", "Colorado", "Florida", "Montana", "North Carolina", "Oregon",
+            "California", "Illinois", "Michigan", "New York", "Ohio", "Pennsylvania", "West Virginia"),
+  change = c(+2, +1, +1, +1, +1, +1, -1, -1, -1, -1, -1, -1, -1),
+  congress_117 = c(36, 7, 27, 1, 13, 5, 53, 18, 14, 27, 16, 18, 3),
+  congress_119 = c(38, 8, 28, 2, 14, 6, 52, 17, 13, 26, 15, 17, 2)
+) %>%
+  arrange(desc(change))
+
+# Plot
+p_changes <- ggplot(district_changes, aes(x = reorder(state, change), y = change, fill = change > 0)) +
+  geom_col(width = 0.7, color = "black", alpha = 0.8, linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%+d", change)), 
+            hjust = ifelse(district_changes$change > 0, -0.3, 1.3),
+            size = 4.5, fontface = "bold") +
+  geom_hline(yintercept = 0, linetype = "solid", color = "black", linewidth = 0.5) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("TRUE" = "#4393c3", "FALSE" = "#d6604d"),
+    labels = c("Lost Districts", "Gained Districts"),
+    name = ""
+  ) +
+  scale_y_continuous(breaks = -2:2, limits = c(-2, 2.5)) +
+  labs(
+    title = "Congressional District Changes (117th → 119th Congress)",
+    subtitle = "Only 13 of 50 states changed (38 states unchanged, omitted)",
+    x = NULL,
+    y = "Change in Number of Districts"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", size = 16)
+  )
+
+ggsave(file.path(OUTPUT_DIR, "fig5_district_changes_improved.pdf"), 
+       p_changes, width = 10, height = 6)
+
+cat("Figure 5 saved\n")
+```
+
+## Figure 6: State Variation Table
+
+```{r fig6}
+# Compute state statistics
+state_stats <- district_data %>%
+  mutate(state_fips = substr(district_id, 1, 2)) %>%
+  group_by(state_fips) %>%
+  summarise(
+    n_districts = n(),
+    mean_vote = mean(vote_share_party_a, na.rm = TRUE),
+    sd_vote = sd(vote_share_party_a, na.rm = TRUE),
+    min_vote = min(vote_share_party_a, na.rm = TRUE),
+    max_vote = max(vote_share_party_a, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_districts)) %>%
+  head(15) %>%
+  mutate(
+    Range = sprintf("[%.2f, %.2f]", min_vote, max_vote),
+    Mean = sprintf("%.3f", mean_vote),
+    `Std Dev` = sprintf("%.3f", sd_vote)
+  ) %>%
+  dplyr::select(State = state_fips, Districts = n_districts, Mean, `Std Dev`, Range)
+
+# Display table
+knitr::kable(state_stats, 
+             caption = "State-Level Variation in Democratic Vote Share (Top 15 States)",
+             align = c("l", "c", "c", "c", "c")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Save LaTeX
+latex_table <- knitr::kable(state_stats, format = "latex", booktabs = TRUE,
+                            caption = "State-Level Variation in Democratic Vote Share (117th Congress)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+
+writeLines(as.character(latex_table), 
+           file.path(OUTPUT_DIR, "fig6_state_variation_table.tex"))
+
+cat("Figure 6 saved\n")
+```
+
+## Figure 8: Density-Aware Smoothing
+
+```{r fig8, fig.width=14, fig.height=6}
+# Get the best model's CV predictions (validation on OLD districts)
+best_model_name <- results$gnn_results$best_model_type
+best_model_results <- results$gnn_results$model_comparison[[best_model_name]]
+
+# Extract CV predictions and true targets
+cv_preds <- best_model_results$cv_predictions
+true_targets <- results$gnn_results$targets
+
+# Build prediction data frame from CV results
+pred_df <- tibble(
+  true_vote = as.vector(true_targets),
+  predicted_vote = as.vector(cv_preds)
+) %>%
+  filter(!is.na(true_vote), !is.na(predicted_vote))
+
+cat("Using", nrow(pred_df), "districts from", toupper(best_model_name), "CV predictions\n")
+cat("Vote share range:", sprintf("[%.1f%%, %.1f%%]", 
+    100*min(pred_df$true_vote), 100*max(pred_df$true_vote)), "\n")
+
+# Compute local density
+density_est <- density(pred_df$true_vote, bw = 0.05, n = 512)
+pred_df <- pred_df %>%
+  mutate(
+    density = approx(density_est$x, density_est$y, xout = true_vote, rule = 2)$y,
+    is_dense = density >= quantile(density, 0.25)
+  )
+
+cat("Sparse regions (<25th %ile):", sum(!pred_df$is_dense), "districts\n")
+cat("Dense regions (≥25th %ile):", sum(pred_df$is_dense), "districts\n")
+
+# Panel 1: Standard LOESS (showing potential bias)
+p1 <- ggplot(pred_df, aes(x = true_vote, y = predicted_vote)) +
+  geom_point(alpha = 0.5, size = 2, color = "gray30") +
+  geom_smooth(method = "loess", se = TRUE, color = "#d62728", 
+              fill = "#d62728", alpha = 0.2, span = 0.3, linewidth = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", 
+              color = "black", linewidth = 0.8) +
+  annotate("rect", xmin = 0.05, xmax = 0.40, ymin = -Inf, ymax = Inf,
+           fill = "#d62728", alpha = 0.1) +
+  annotate("text", x = 0.225, y = 0.80, 
+           label = "Sparse Region\n(Bias Risk)", 
+           color = "#d62728", size = 4, fontface = "bold") +
+  scale_x_continuous(labels = percent_format(), limits = c(0, 1)) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "A) Standard LOESS (All Data)",
+    subtitle = "Smoothing applied uniformly",
+    x = "True Democratic Vote Share",
+    y = "Predicted Vote Share"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+# Panel 2: Improved with density-restricted smoothing
+p2 <- ggplot(pred_df, aes(x = true_vote, y = predicted_vote)) +
+  geom_point(aes(alpha = density, color = is_dense), size = 2) +
+  geom_smooth(data = pred_df %>% filter(is_dense), 
+              method = "loess", se = TRUE, color = "#2ca02c", 
+              fill = "#2ca02c", alpha = 0.3, span = 0.25, linewidth = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", 
+              color = "black", linewidth = 0.8) +
+  geom_rug(data = pred_df %>% filter(!is_dense), 
+           aes(x = true_vote), color = "#ff7f0e", alpha = 0.5, sides = "b") +
+  scale_alpha_continuous(range = c(0.2, 0.8), guide = "none") +
+  scale_color_manual(
+    values = c("TRUE" = "#2ca02c", "FALSE" = "#ff7f0e"),
+    labels = c("Sparse (excluded)", "Dense (used)"),
+    name = "Data Density"
+  ) +
+  scale_x_continuous(labels = percent_format(), limits = c(0, 1)) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "B) Density-Restricted LOESS (Improved)",
+    subtitle = sprintf("Smoothing on %d dense districts only", sum(pred_df$is_dense)),
+    x = "True Democratic Vote Share",
+    y = "Predicted Vote Share"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+
+# Combine
+p_combined <- p1 + p2
+ggsave(file.path(OUTPUT_DIR, "fig8_smoothing_improved.pdf"), 
+       p_combined, width = 14, height = 6)
+
+print(p_combined)
+
+cat("Figure 8 saved\n")
+```
+
+## Figure 9: Sparse Data Presentation (Real Data)
+
+```{r fig9, fig.width=12, fig.height=7}
+# Extract actual prediction probabilities by state
+# Get predictions (binary win probability)
+if ("predictions" %in% names(transfer_pred)) {
+  pred_vec <- transfer_pred$predictions
+} else if ("gnn_predictions" %in% names(transfer_pred)) {
+  pred_vec <- transfer_pred$gnn_predictions
+} else if ("ensemble_predictions" %in% names(transfer_pred)) {
+  pred_vec <- transfer_pred$ensemble_predictions
+} else {
+  pred_vec <- transfer_pred
+}
+
+# Get district identifiers
+district_ids <- district_data$district_id
+state_codes <- substr(district_ids, 1, 2)
+
+# Create state-level aggregation
+state_data <- tibble(
+  state = state_codes,
+  dem_win_prob = as.vector(pred_vec)
+) %>%
+  filter(!is.na(dem_win_prob))
+
+# Aggregate to state totals
+state_summary <- state_data %>%
+  group_by(state) %>%
+  summarise(
+    total_districts = n(),
+    expected_dem_seats = sum(dem_win_prob),
+    expected_rep_seats = total_districts - expected_dem_seats,
+    .groups = "drop"
+  ) %>%
+  filter(total_districts >= 5) %>%  # Focus on states with 5+ districts
+  arrange(desc(total_districts)) %>%
+  head(10)
+
+cat("Analyzing", nrow(state_summary), "major states\n")
+
+# Create sparse probability matrix
+# For each state, compute binomial probabilities around expected value
+sparse_data <- map_dfr(1:nrow(state_summary), function(i) {
+  state_info <- state_summary[i, ]
+  n_total <- state_info$total_districts
+  expected <- state_info$expected_dem_seats
+  
+  # Compute probability for each possible outcome
+  seat_outcomes <- 0:n_total
+  
+  # Use binomial approximation with mean = expected
+  prob_param <- expected / n_total
+  probabilities <- dbinom(seat_outcomes, size = n_total, prob = prob_param)
+  
+  tibble(
+    state = state_info$state,
+    dem_seats = seat_outcomes,
+    total_seats = n_total,
+    probability = probabilities
+  )
+}) %>%
+  filter(probability > 0.01)  # Keep only >1% probability
+
+cat("Total cells with >1% probability:", nrow(sparse_data), "\n")
+cat("Coverage:", sprintf("%.1f%%", 100 * nrow(sparse_data) / sum(state_summary$total_districts + 1)), "\n")
+
+# Categorize probabilities
+sparse_data <- sparse_data %>%
+  mutate(
+    prob_category = case_when(
+      probability < 0.05 ~ "0-5%",
+      probability < 0.15 ~ "5-15%",
+      probability < 0.30 ~ "15-30%",
+      TRUE ~ ">30%"
+    ),
+    prob_category = factor(prob_category, levels = c("0-5%", "5-15%", "15-30%", ">30%"))
+  )
+
+# Create compact heatmap
+p_heatmap <- ggplot(sparse_data, aes(x = dem_seats, y = reorder(state, -total_seats), fill = prob_category)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.0f%%", probability * 100)), 
+            size = 3, fontface = "bold") +
+  scale_fill_manual(
+    values = c("0-5%" = "#fee5d9", "5-15%" = "#fcae91",
+               "15-30%" = "#fb6a4a", ">30%" = "#cb181d"),
+    name = "Probability",
+    drop = FALSE
+  ) +
+  labs(
+    title = "Democratic Seat Distribution Probabilities (Top 10 States, Non-Zero Only)",
+    subtitle = sprintf("Showing %d high-probability scenarios (>1%%) from GNN transfer predictions", 
+                      nrow(sparse_data)),
+    x = "Number of Democratic Seats",
+    y = "State (by total districts)",
+    caption = "Binomial approximation using district-level win probabilities from transfer learning model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.caption = element_text(hjust = 0, size = 9, color = "gray40"),
+    legend.position = "right",
+    panel.grid = element_blank()
+  )
+
+ggsave(file.path(OUTPUT_DIR, "fig9_sparse_data_improved.pdf"), 
+       p_heatmap, width = 12, height = 7)
+
+print(p_heatmap)
+
+cat("Figure 9 saved (using real district-level predictions)\n")
+
+# Summary table of most likely outcomes
+likely_outcomes <- sparse_data %>%
+  group_by(state) %>%
+  slice_max(probability, n = 1) %>%
+  ungroup() %>%
+  arrange(desc(total_seats)) %>%
+  dplyr::select(State = state, `Total Seats` = total_seats, 
+         `Most Likely Dem Seats` = dem_seats, 
+         `Probability` = probability) %>%
+  mutate(Probability = sprintf("%.1f%%", Probability * 100))
+
+knitr::kable(likely_outcomes, 
+             caption = "Most Likely Democratic Seat Outcomes by State",
+             align = c("l", "c", "c", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+

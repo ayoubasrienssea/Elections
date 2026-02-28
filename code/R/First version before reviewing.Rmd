@@ -1,0 +1,1805 @@
+---
+title: "Cross-District Electoral Forecasting via Graph Neural Networks with Uncertainty-Aware Transfer Learning: A Comprehensive Framework for Redistricting Analysis"
+output: html_document
+date: ""
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load all required libraries
+
+```{r}
+# Load all required libraries
+library(MASS)
+library(sf)
+library(igraph)
+library(Matrix)
+library(ggplot2)
+library(viridis)
+library(caret)
+library(keras3)
+library(deldir)
+library(gstat)
+library(spdep)
+library(gridExtra)
+library(gt)
+library(scales)
+library(ggraph)
+library(tidycensus)
+library(units)
+library(tidyverse)
+library(patchwork)
+library(geostan)
+library(RColorBrewer)
+library(tictoc)
+
+
+set.seed(42)
+```
+
+## PART 1: LOAD NATIONAL REDISTRICTING DATA 
+
+```{r}
+
+
+load_national_redistricting_data <- function(data_path = "./national_data/",
+                                             census_api_key = NULL,
+                                             use_precinct_aggregation = FALSE,
+                                             use_rdh_election_data = TRUE) {  
+  
+  # --------------------------------------------------------------------------
+  # INITIALIZATION
+  # --------------------------------------------------------------------------
+  if(!is.null(census_api_key)) {
+    tidycensus::census_api_key(census_api_key, install = TRUE)
+    cat("Census API key installed.\n")
+  }
+
+  # Load built-in FIPS codes from tidycensus
+  data("fips_codes", package = "tidycensus")
+  state_fips_lookup <- fips_codes %>%
+    select(state_code, state_name, state) %>%
+    distinct()
+
+  cat("\n")
+  cat(" \n")
+  cat("           LOADING NATIONAL REDISTRICTING DATA                      \n")
+  cat("\n\n")
+
+  # --------------------------------------------------------------------------
+  # DEFINE DATA PATHS
+  # --------------------------------------------------------------------------
+  paths <- list(
+    districts_117th = file.path(data_path, "national_cong117_boundary.shp"),
+    districts_119th = file.path(data_path, "national_cong119_boundary.shp"),
+    district_data_119th = file.path(data_path, "national_cong119_district_data.csv"),
+    election_2020 = file.path(data_path, "PRESIDENT_precinct_general.csv"),
+    precinct_boundaries_2020 = file.path(data_path, "national_2020_prec_bounds.shp")
+  )
+  
+  cat("1. Defined data paths.\n")
+
+  # --------------------------------------------------------------------------
+  # 1. LOAD CONGRESSIONAL DISTRICT BOUNDARIES
+  # --------------------------------------------------------------------------
+  cat("\n2. Loading Congressional District Boundaries...\n")
+  
+  load_districts <- function(path, plan_year, cong_col) {
+    tic(paste("Loading", plan_year, "districts"))
+    
+    districts_sf <- st_read(path, quiet = TRUE) %>%
+      st_make_valid() %>%
+      st_transform(crs = 4326)
+    
+    districts_sf <- districts_sf %>%
+      rename(CONG_DISTRICT = all_of(cong_col))
+    
+    districts_sf <- districts_sf %>%
+      left_join(state_fips_lookup, by = c("STATE" = "state")) %>%
+      mutate(
+        state_fips = str_pad(state_code, 2, pad = "0"),
+        district_num = case_when(
+          DISTRICT == "AT-LARGE" ~ "00",
+          TRUE ~ str_pad(str_remove_all(DISTRICT, "[^0-9]"), 2, pad = "0")
+        ),
+        district_id = paste(state_fips, district_num, sep = "-"),
+        plan_year = plan_year
+      ) %>%
+      select(district_id, state_fips, district_num, plan_year, geometry) %>%
+      arrange(state_fips, district_num)
+    
+    toc()
+    return(districts_sf)
+  }
+
+  old_districts <- load_districts(paths$districts_117th, 2021, "CONG117")
+  cat("    Loaded", nrow(old_districts), "old districts (117th Congress).\n")
+  
+  new_districts <- load_districts(paths$districts_119th, 2023, "CONG119")
+  cat("    Loaded", nrow(new_districts), "new districts (119th Congress).\n")
+
+  # --------------------------------------------------------------------------
+  # 2. LOAD AND PROCESS RDH DISTRICT-LEVEL DATA
+  # --------------------------------------------------------------------------
+  cat("\n3. Loading RDH District-Level Data...\n")
+  
+  if(file.exists(paths$district_data_119th)) {
+    rdh_data <- read_csv(paths$district_data_119th, show_col_types = FALSE,
+                         col_types = cols(.default = col_guess()))
+    
+    cat("   RDH file loaded with", nrow(rdh_data), "rows\n")
+    
+    rdh_data_clean <- rdh_data %>%
+      left_join(state_fips_lookup, by = c("STATE" = "state")) %>%
+      mutate(
+        district_num = case_when(
+          DISTRICT == "AT-LARGE" ~ "00",
+          TRUE ~ str_pad(str_remove_all(DISTRICT, "[^0-9]"), 2, pad = "0")
+        ),
+        district_id = paste(str_pad(state_code, 2, pad = "0"), district_num, sep = "-"),
+        median_income = as.numeric(gsub("[^0-9.]", "", Median_HH_Income_Est))
+      ) %>%
+      select(
+        district_id,
+        totpop = TOTPOP20,
+        white_pct = `NH White`,
+        black_pct = `NH Black plus NH Black and White`,
+        hispanic_pct = Hispanic,
+        median_income,
+        college_pct = BACH_PLUS_pct,
+        dem_votes_2020_pct = G20PREDBID_pct,
+        rep_votes_2020_pct = G20PRERTRU_pct,
+        total_votes_est = Total_20_Pres_Votes_Est
+      ) %>%
+      mutate(
+        dem_votes_2020_pct = ifelse(dem_votes_2020_pct > 1, dem_votes_2020_pct/100, dem_votes_2020_pct),
+        rep_votes_2020_pct = ifelse(rep_votes_2020_pct > 1, rep_votes_2020_pct/100, rep_votes_2020_pct),
+        dem_votes_2020 = round(total_votes_est * dem_votes_2020_pct),
+        rep_votes_2020 = round(total_votes_est * rep_votes_2020_pct),
+        minority_pct = 1 - white_pct
+      ) %>%
+      arrange(district_id)
+    
+    # Check how many NAs were created
+    na_count <- sum(is.na(rdh_data_clean$median_income))
+    if(na_count > 0) {
+      cat("   Warning:", na_count, "income values could not be converted and are NA\n")
+    }
+    
+    cat("    Processed RDH data for", nrow(rdh_data_clean), "districts.\n")
+    
+  } else {
+    cat("   RDH file not found. Proceeding without it.\n")
+    rdh_data_clean <- tibble(district_id = character())
+  }
+
+  # --------------------------------------------------------------------------
+  # 3. PROCESS ELECTION DATA (SIMPLIFIED - USE RDH DATA BY DEFAULT)
+  # --------------------------------------------------------------------------
+  cat("\n4. Processing Election Data...\n")
+  
+  # OPTION 1: Use RDH election data 
+  if(use_rdh_election_data && "dem_votes_2020" %in% names(rdh_data_clean) && 
+     "rep_votes_2020" %in% names(rdh_data_clean)) {
+    
+    cat("   Using RDH district-level 2020 election data...\n")
+    
+    old_elections <- rdh_data_clean %>%
+      select(district_id, dem_votes_2020, rep_votes_2020) %>%
+      mutate(
+        total_dem_votes = dem_votes_2020,
+        total_rep_votes = rep_votes_2020,
+        total_votes = total_dem_votes + total_rep_votes,
+        vote_share_dem = if_else(total_votes > 0, total_dem_votes / total_votes, NA_real_),
+        election_year = 2020
+      ) %>%
+      select(district_id, total_dem_votes, total_rep_votes, total_votes,
+             vote_share_dem, election_year)
+    
+    cat("    Created election data from RDH for", nrow(old_elections), "districts.\n")
+    
+  } else if(file.exists(paths$election_2020) && !use_rdh_election_data) {
+        # OPTION 2: Process MIT precinct data 
+    cat("   Processing MIT precinct data...\n")
+    
+    tic("Reading MIT precinct election file")
+    election_raw <- read_csv(paths$election_2020, show_col_types = FALSE,
+                             col_types = cols(.default = col_guess()))
+    toc()
+    
+    cat("   MIT data has", nrow(election_raw), "rows (long format)\n")
+    
+    election_wide <- election_raw %>%
+      filter(office == "US PRESIDENT") %>%
+      select(precinct, party_simplified, votes, state_po, county_fips) %>%
+      # Create party groups
+      mutate(
+        party_group = case_when(
+          party_simplified == "DEMOCRAT" ~ "democrat",
+          party_simplified == "REPUBLICAN" ~ "republican",
+          party_simplified == "LIBERTARIAN" ~ "libertarian",
+          party_simplified == "GREEN" ~ "green",
+          TRUE ~ "other"
+        )
+      ) %>%
+      # First, aggregate any duplicate precinct-party combinations
+      group_by(precinct, party_group, state_po, county_fips) %>%
+      summarise(votes = sum(votes, na.rm = TRUE), .groups = "drop") %>%
+      # Then complete to ensure all party groups
+      complete(precinct, 
+               party_group = c("democrat", "republican", "libertarian", "green", "other"),
+               fill = list(votes = 0)) %>%
+      # Fill missing state_po and county_fips
+      group_by(precinct) %>%
+      fill(state_po, county_fips, .direction = "downup") %>%
+      ungroup() %>%
+      # Now pivot to wide format - votes should be a regular numeric column
+      pivot_wider(
+        id_cols = c("precinct", "state_po", "county_fips"),  
+        names_from = "party_group",
+        values_from = "votes",
+        values_fill = 0
+      ) %>%
+      # Calculate totals
+      mutate(
+        total_votes = democrat + republican + libertarian + green + other,
+        dem_votes = democrat,
+        rep_votes = republican,
+        vote_share_dem = ifelse(total_votes > 0, democrat / total_votes, NA_real_)
+      )
+    
+    cat("   Processed", nrow(election_wide), "precincts.\n")
+    
+    # Simple aggregation to districts (county-based approximation)
+    election_by_county <- election_wide %>%
+      mutate(
+        county_fips_str = sprintf("%05d", as.numeric(county_fips)),
+        state_fips = substr(county_fips_str, 1, 2)
+      ) %>%
+      group_by(state_fips, county_fips_str) %>%
+      summarise(
+        total_dem_votes = sum(dem_votes, na.rm = TRUE),
+        total_rep_votes = sum(rep_votes, na.rm = TRUE),
+        total_votes = sum(total_votes, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        vote_share_dem = ifelse(total_votes > 0, total_dem_votes / total_votes, NA_real_)
+      )
+    
+    # Assign counties to districts (simplified)
+    old_elections <- old_districts %>%
+      st_drop_geometry() %>%
+      select(district_id, state_fips) %>%
+      left_join(election_by_county, by = "state_fips") %>%
+      group_by(district_id) %>%
+      summarise(
+        total_dem_votes = sum(total_dem_votes, na.rm = TRUE),
+        total_rep_votes = sum(total_rep_votes, na.rm = TRUE),
+        total_votes = sum(total_votes, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        vote_share_dem = ifelse(total_votes > 0, total_dem_votes / total_votes, NA_real_),
+        election_year = 2020
+      )
+    
+    cat("    Aggregated MIT data to", nrow(old_elections), "districts.\n")
+    
+  } 
+
+  # --------------------------------------------------------------------------
+  # 4. FETCH ACS DEMOGRAPHIC DATA
+  # --------------------------------------------------------------------------
+  cat("\n5. Fetching ACS Demographic Data...\n")
+
+  fetch_census_data <- function(district_ids) {
+    dist_info <- tibble(district_id = district_ids) %>%
+      mutate(
+        state_fips = substr(district_id, 1, 2),
+        dist_num = as.numeric(substr(district_id, 4, 5))
+      ) %>%
+      left_join(state_fips_lookup, by = c("state_fips" = "state_code"))
+
+    states_to_fetch <- unique(na.omit(dist_info$state))
+
+    census_list <- list()
+    for(st in states_to_fetch) {
+      cat("    Fetching for state:", st, "\n")
+      tryCatch({
+        state_data <- get_acs(
+          geography = "congressional district",
+          variables = c(
+            med_income = "B19013_001",
+            med_age = "B01002_001",
+            total_pop = "B01003_001",
+            pop_white = "B02001_002",
+            pop_college = "B15003_022"
+          ),
+          state = st,
+          year = 2020,
+          survey = "acs5",
+          geometry = FALSE,
+          cache_table = TRUE
+        ) %>%
+          pivot_wider(id_cols = GEOID, names_from = variable, values_from = estimate) %>%
+          mutate(
+            district_id = paste0(
+              substr(GEOID, 1, 2),
+              "-",
+              sprintf("%02d", as.numeric(substr(GEOID, 3, nchar(GEOID))))
+            ),
+            white_pct = pop_white / total_pop,
+            college_pct = pop_college / total_pop
+          ) %>%
+          select(district_id, med_income, med_age, total_pop, white_pct, college_pct)
+
+        census_list[[st]] <- state_data
+      }, error = function(e) {
+        cat("      Failed for", st, ":", e$message, "\n")
+      })
+    }
+
+    if(length(census_list) == 0) {
+      return(tibble(district_id = character()))
+    }
+
+    bind_rows(census_list)
+  }
+
+  acs_data_old <- fetch_census_data(old_districts$district_id)
+  cat("    Fetched ACS data for", nrow(acs_data_old), "old districts.\n")
+
+  # --------------------------------------------------------------------------
+  # 5. CALCULATE SPATIAL MATRICES
+  # --------------------------------------------------------------------------
+  cat("\n6. Calculating Spatial Matrices...\n")
+
+  calculate_adjacency_matrix <- function(district_sf) {
+    nb <- spdep::poly2nb(as(district_sf, "Spatial"), queen = TRUE)
+    adj_mat <- spdep::nb2mat(nb, style = "B", zero.policy = TRUE)
+    rownames(adj_mat) <- colnames(adj_mat) <- district_sf$district_id
+    diag(adj_mat) <- 1
+    return(adj_mat)
+  }
+
+  tic("Calculating adjacency matrices")
+  adj_matrix_old <- calculate_adjacency_matrix(old_districts)
+  adj_matrix_new <- calculate_adjacency_matrix(new_districts)
+  toc()
+
+  calculate_overlap_matrix <- function(new_sf, old_sf) {
+    n_new <- nrow(new_sf)
+    n_old <- nrow(old_sf)
+    overlap_mat <- matrix(0, nrow = n_new, ncol = n_old)
+
+    new_centroids <- st_coordinates(st_centroid(new_sf))
+    old_centroids <- st_coordinates(st_centroid(old_sf))
+
+    for(i in 1:n_new) {
+      distances <- sqrt((new_centroids[i,1] - old_centroids[,1])^2 +
+                        (new_centroids[i,2] - old_centroids[,2])^2)
+      weights <- 1 / (distances + 0.01)
+      overlap_mat[i, ] <- weights / sum(weights)
+    }
+
+    rownames(overlap_mat) <- new_sf$district_id
+    colnames(overlap_mat) <- old_sf$district_id
+    return(overlap_mat)
+  }
+
+  overlap_matrix <- calculate_overlap_matrix(new_districts, old_districts)
+  cat("    Calculated adjacency and overlap matrices.\n")
+
+  # --------------------------------------------------------------------------
+  # 6. COMBINE ALL DATA INTO FINAL STRUCTURES
+  # --------------------------------------------------------------------------
+  cat("\n7. Combining all data into final structures...\n")
+
+  old_districts_complete <- old_districts %>%
+    left_join(acs_data_old, by = "district_id") %>%
+    left_join(old_elections, by = "district_id") %>%
+    left_join(rdh_data_clean, by = "district_id") %>%
+    mutate(
+      population = coalesce(total_pop, totpop),
+      white_pct = coalesce(white_pct.x, white_pct.y),
+      college_pct = coalesce(college_pct.x, college_pct.y),
+      median_income = coalesce(med_income, median_income),
+      urban_density = log10(pmax(population, 1000)),
+      income_level = as.vector(scale(median_income)),
+      education_level = as.vector(scale(college_pct)),
+      minority_pct = 1 - white_pct,
+      age_median = med_age,
+      turnout_history = total_votes / population,
+      vote_share_party_a = vote_share_dem,
+      model_features_complete = TRUE
+    ) %>%
+    select(
+      district_id, state_fips, district_num, plan_year,
+      geometry,
+      urban_density, income_level, education_level,
+      minority_pct, age_median, population, turnout_history,
+      vote_share_party_a,
+      total_dem_votes, total_rep_votes, total_votes,
+      median_income, med_age, white_pct, college_pct
+    )
+
+  new_districts_complete <- new_districts %>%
+    left_join(rdh_data_clean, by = "district_id") %>%
+    mutate(
+      vote_share_party_a = NA_real_,
+      election_year = NA_real_,
+      model_features_complete = TRUE
+    )
+
+  cat("   Final dataset sizes:\n")
+  cat("   - Old districts:", nrow(old_districts_complete), "\n")
+  cat("   - New districts:", nrow(new_districts_complete), "\n")
+
+  # --------------------------------------------------------------------------
+  # RETURN COMPREHENSIVE DATA OBJECT
+  # --------------------------------------------------------------------------
+  cat("\n8. Data loading complete.\n")
+
+  return(list(
+    old_districts = old_districts_complete,
+    new_districts = new_districts_complete,
+    old_elections = old_elections,
+    adj_matrix_old = adj_matrix_old,
+    adj_matrix_new = adj_matrix_new,
+    overlap_matrix = overlap_matrix,
+    region_type = "national",
+    metadata = list(
+      old_plan_year = 2021,
+      new_plan_year = 2023,
+      election_year = 2020,
+      data_loaded = Sys.time(),
+      n_old_districts = nrow(old_districts_complete),
+      n_new_districts = nrow(new_districts_complete),
+      states_represented = length(unique(old_districts_complete$state_fips))
+    )
+  ))
+}
+```
+
+## PART 2: ENHANCED EXPLORATORY DATA ANALYSIS
+
+```{r}
+perform_comprehensive_eda <- function(data) {
+  
+  cat("\n")
+  cat("\n")
+  cat("                  COMPREHENSIVE EXPLORATORY DATA ANALYSIS            \n")
+  cat("\n\n")
+  
+  # Extract data for analysis
+  old_data <- data$old_districts %>% st_drop_geometry()
+  
+  # 1. NATIONAL DISTRIBUTION PLOTS
+  cat("1. Creating National Distribution Plots...\n")
+  
+  # Select key variables for distribution analysis
+  plot_data <- old_data %>%
+    select(vote_share_party_a, urban_density, income_level, 
+           education_level, minority_pct, age_median) %>%
+    rename(
+      `Democratic Vote Share` = vote_share_party_a,
+      `Urban Density (log)` = urban_density,
+      `Income Level (z-score)` = income_level,
+      `Education Level (z-score)` = education_level,
+      `Minority Percentage` = minority_pct,
+      `Median Age` = age_median
+    )
+  
+  # Create histogram grid
+  p_histograms <- plot_data %>%
+    pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+    ggplot(aes(x = value)) +
+    geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7, color = "white") +
+    facet_wrap(~variable, scales = "free", ncol = 3) +
+    labs(
+      title = "National Distribution of Congressional District Characteristics",
+      subtitle = "Based on 117th Congress (Pre-Redistricting) Districts",
+      x = "Value",
+      y = "Frequency"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5),
+      strip.text = element_text(face = "bold")
+    )
+  
+  # Save individually
+  ggsave("national_distributions.png", p_histograms, width = 14, height = 10, dpi = 300)
+  
+  # 2. CORRELATION HEATMAP
+  cat("2. Creating Correlation Heatmap...\n")
+  
+  cor_matrix <- cor(plot_data, use = "complete.obs")
+  
+  p_correlation <- cor_matrix %>%
+    as.data.frame() %>%
+    rownames_to_column("var1") %>%
+    pivot_longer(cols = -var1, names_to = "var2") %>%
+    ggplot(aes(x = var1, y = var2, fill = value)) +
+    geom_tile(color = "white") +
+    scale_fill_gradient2(
+      low = "#d73027", mid = "#ffffbf", high = "#1a9850",
+      midpoint = 0, limits = c(-1, 1),
+      name = "Correlation"
+    ) +
+    geom_text(aes(label = round(value, 2)), color = "black", size = 3.5) +
+    labs(
+      title = "Correlation Matrix of District Characteristics",
+      subtitle = "Pearson correlation coefficients between key variables",
+      x = "", y = ""
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+      axis.text.y = element_text(size = 10),
+      legend.position = "right"
+    )
+  
+  ggsave("correlation_heatmap.png", p_correlation, width = 10, height = 8, dpi = 300)
+  
+  # 3. SPATIAL AUTOCORRELATION ANALYSIS
+  cat("3. Analyzing Spatial Autocorrelation...\n")
+  
+  analyze_spatial_autocorrelation <- function(sf_data, variable_name) {
+    # Extract variable and check for NAs
+    var_vector <- sf_data[[variable_name]]
+    
+    if(any(is.na(var_vector))) {
+      cat(paste0("    Removing ", sum(is.na(var_vector)), " NA values for ", variable_name, "\n"))
+      # Identify non-missing indices
+      non_na <- !is.na(var_vector)
+      
+      # Subset the sf object to non-missing rows
+      sf_subset <- sf_data[non_na, ]
+      
+      # Convert subset to spatial object
+      sp_data <- as(sf_subset, "Spatial")
+    } else {
+      sf_subset <- sf_data
+      sp_data <- as(sf_data, "Spatial")
+    }
+    
+    # Create neighbors list
+    nb <- poly2nb(sp_data, queen = TRUE)
+    lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+    
+    # Calculate Moran's I
+    moran_result <- moran.test(sf_subset[[variable_name]], lw, zero.policy = TRUE)
+    
+    # Create Moran scatterplot
+    variable <- sf_subset[[variable_name]]
+    lag_variable <- lag.listw(lw, variable, zero.policy = TRUE)
+    
+    moran_df <- data.frame(
+      variable = variable,
+      lag_variable = lag_variable
+    )
+    
+    p_moran <- ggplot(moran_df, aes(x = variable, y = lag_variable)) +
+      geom_point(alpha = 0.6, color = "steelblue") +
+      geom_smooth(method = "lm", color = "#d73027", se = FALSE) +
+      geom_hline(yintercept = mean(variable, na.rm = TRUE), linetype = "dashed", alpha = 0.5) +
+      geom_vline(xintercept = mean(variable, na.rm = TRUE), linetype = "dashed", alpha = 0.5) +
+      labs(
+        title = paste("Moran Scatterplot for", variable_name),
+        subtitle = paste("Moran's I =", round(moran_result$estimate[1], 3),
+                        "(p =", round(moran_result$p.value, 4), ")"),
+        x = variable_name,
+        y = paste("Spatially Lagged", variable_name)
+      ) +
+      theme_minimal() +
+      theme(plot.title = element_text(face = "bold"))
+    
+    return(list(
+      plot = p_moran,
+      moran_i = moran_result$estimate[1],
+      p_value = moran_result$p.value,
+      n_used = length(variable)
+    ))
+  }
+  
+  # Analyze key variables
+  spatial_results <- list()
+  
+  for(var in c("vote_share_party_a", "income_level", "minority_pct")) {
+    result <- analyze_spatial_autocorrelation(data$old_districts, var)
+    spatial_results[[var]] <- result
+    
+    # Save individual Moran plots
+    ggsave(
+      paste0("moran_plot_", var, ".png"), 
+      result$plot, 
+      width = 8, height = 6, dpi = 300
+    )
+  }
+  
+  # 4. STATE-LEVEL VARIATION ANALYSIS
+  cat("4. Analyzing State-Level Variation...\n")
+  
+  # Calculate state-level statistics
+  state_stats <- data$old_districts %>%
+    st_drop_geometry() %>%
+    group_by(state_fips) %>%
+    summarise(
+      n_districts = n(),
+      avg_dem_vote = mean(vote_share_party_a, na.rm = TRUE),
+      sd_dem_vote = sd(vote_share_party_a, na.rm = TRUE),
+      avg_income = mean(income_level, na.rm = TRUE),
+      avg_minority = mean(minority_pct, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(avg_dem_vote))
+  
+  # Create state-level comparison plot
+  p_state_variation <- state_stats %>%
+    top_n(20, n_districts) %>%  # Top 20 states by number of districts
+    ggplot(aes(x = reorder(state_fips, avg_dem_vote), y = avg_dem_vote)) +
+    geom_bar(stat = "identity", fill = "steelblue", alpha = 0.7) +
+    geom_errorbar(aes(ymin = avg_dem_vote - sd_dem_vote, 
+                      ymax = avg_dem_vote + sd_dem_vote),
+                  width = 0.2, color = "darkred") +
+    coord_flip() +
+    labs(
+      title = "State-Level Variation in Democratic Vote Share",
+      subtitle = "Top 20 states by number of congressional districts (error bars show ±1 SD)",
+      x = "State FIPS Code",
+      y = "Average Democratic Vote Share (2020)"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.text.y = element_text(size = 10)
+    )
+  
+  ggsave("state_variation_plot.png", p_state_variation, width = 12, height = 8, dpi = 300)
+  
+  # 5. REDISTRICTING IMPACT VISUALIZATION
+  cat("5. Visualizing Redistricting Impacts...\n")
+  
+  # Calculate district count changes by state
+  if(exists("new_districts", where = data)) {
+    district_counts <- data.frame(
+      state_fips = c(data$old_districts$state_fips, data$new_districts$state_fips),
+      plan = c(rep("Old", nrow(data$old_districts)), rep("New", nrow(data$new_districts)))
+    ) %>%
+      group_by(state_fips, plan) %>%
+      summarise(n_districts = n(), .groups = "drop") %>%
+      pivot_wider(names_from = plan, values_from = n_districts, values_fill = 0) %>%
+      mutate(district_change = New - Old)
+    
+    p_district_changes <- district_counts %>%
+      ggplot(aes(x = reorder(state_fips, district_change), y = district_change)) +
+      geom_bar(stat = "identity", aes(fill = district_change > 0), alpha = 0.7) +
+      scale_fill_manual(values = c("TRUE" = "#1a9850", "FALSE" = "#d73027"), guide = "none") +
+      coord_flip() +
+      labs(
+        title = "Congressional District Changes by State (Old → New Plan)",
+        subtitle = "Positive values indicate gain of districts; negative values indicate loss",
+        x = "State FIPS Code",
+        y = "Change in Number of Districts"
+      ) +
+      theme_minimal() +
+      theme(plot.title = element_text(face = "bold", hjust = 0.5))
+    
+    ggsave("district_changes_by_state.png", p_district_changes, width = 10, height = 12, dpi = 300)
+  }
+  
+  cat("\n All EDA plots saved as individual PNG files.\n")
+  
+  return(list(
+    histograms = p_histograms,
+    correlation = p_correlation,
+    spatial_results = spatial_results,
+    state_variation = p_state_variation,
+    district_changes = if(exists("p_district_changes")) p_district_changes else NULL,
+    state_stats = state_stats
+  ))
+}
+```
+
+## PART 3: GNN ARCHITECTURES USING KERAS3
+
+```{r}
+# Function 1: Simple GNN (no attention)
+build_simple_gnn <- function(n_features, hidden_units = c(64, 32, 16), 
+                            dropout_rate = 0.3, learning_rate = 0.001) {
+  
+  cat("Building simple GNN model with keras3...\n")
+  
+  # Input layer
+  features_input <- layer_input(shape = c(n_features), name = "node_features")
+  
+  # Hidden layers with keras3 syntax
+  hidden <- features_input |>
+    layer_dense(units = hidden_units[1], 
+                activation = "relu",
+                kernel_initializer = initializer_glorot_uniform(seed = 42)) |>
+    layer_batch_normalization() |>
+    layer_dropout(rate = dropout_rate) |>
+    
+    layer_dense(units = hidden_units[2], 
+                activation = "relu",
+                kernel_initializer = initializer_he_normal(seed = 42)) |>
+    layer_batch_normalization() |>
+    layer_dropout(rate = dropout_rate) |>
+    
+    layer_dense(units = hidden_units[3], 
+                activation = "relu") |>
+    layer_batch_normalization()
+  
+  # Output layer - LINEAR activation for regression (prevents constant predictions)
+  output <- hidden |>
+    layer_dense(units = 1, 
+                activation = "linear",
+                kernel_initializer = initializer_glorot_uniform(seed = 42))
+  
+  # Create model
+  model <- keras_model(inputs = features_input, outputs = output)
+  
+  # Compile with proper settings for keras3
+  model |> compile(
+    optimizer = optimizer_adam(learning_rate = learning_rate, clipnorm = 0.5),
+    loss = "mse",  
+    metrics = list("mae", "mse") 
+  )
+  
+  cat("Simple GNN model built successfully with keras3!\n")
+  return(model)
+}
+
+# Function 2: GNN with Attention Mechanism (keras3 version)
+build_attention_gnn <- function(n_features, hidden_units = c(64, 32, 16), 
+                               dropout_rate = 0.3, learning_rate = 0.001) {
+
+  cat("Building attention GNN model with keras3 (using layer_attention)...\n")
+
+  # Input layer
+  features_input <- layer_input(shape = c(n_features), name = "node_features")
+
+  # Process features to create query, key, value tensors
+  # For self-attention on features, we use the same processed tensor
+  processed_features <- features_input |>
+    layer_dense(units = hidden_units[1], activation = "relu") |>
+    layer_batch_normalization() |>
+    layer_dropout(rate = dropout_rate)
+
+  # Reshape: Convert from (batch, features) to (batch, 1, features) for attention
+  # Attention layer often expects a sequence dimension (timesteps).
+  # Since we have district features as a "sequence of length 1", we add it.
+  features_sequence <- layer_reshape(processed_features, target_shape = c(1, hidden_units[1]))
+
+  # Apply the built-in attention layer.
+  # For self-attention, 'query', 'key', and 'value' are the same tensor.
+  attention_output <- layer_attention(use_scale = FALSE)(list(features_sequence, features_sequence))
+
+  # Remove the sequence dimension we added
+  attention_pooled <- layer_global_average_pooling_1d()(attention_output)
+
+  # Continue with the rest of the network
+  hidden <- attention_pooled |>
+    layer_dense(units = hidden_units[2], activation = "relu") |>
+    layer_batch_normalization() |>
+    layer_dropout(rate = dropout_rate) |>
+    layer_dense(units = hidden_units[3], activation = "relu") |>
+    layer_batch_normalization()
+
+  # Output layer
+  output <- hidden |>
+    layer_dense(units = 1, activation = "linear")
+
+  # Create and compile model
+  model <- keras_model(inputs = features_input, outputs = output)
+
+  model |> compile(
+    optimizer = optimizer_adam(learning_rate = learning_rate, clipnorm = 0.5),
+    loss = "mse",
+    metrics = list("mae")
+  )
+
+  cat("Attention GNN model built successfully with keras3!\n")
+  return(model)
+}
+
+# Function 3: Hybrid GNN (GNN + Spatial features)
+build_hybrid_gnn <- function(n_features, hidden_units = c(64, 32, 16), 
+                            dropout_rate = 0.3, learning_rate = 0.001) {
+  
+  cat("Building hybrid GNN model with keras3...\n")
+  
+  # Input layer
+  features_input <- layer_input(shape = c(n_features), name = "node_features")
+  
+  # Two parallel streams
+  stream1 <- features_input |>
+    layer_dense(units = hidden_units[1], activation = "relu") |>
+    layer_batch_normalization() |>
+    layer_dropout(rate = dropout_rate)
+  
+  stream2 <- features_input |>
+    layer_dense(units = hidden_units[1], activation = "tanh") |>
+    layer_batch_normalization() |>
+    layer_dense(units = hidden_units[2], activation = "relu") |>
+    layer_dropout(rate = dropout_rate)
+  
+  # Combine streams
+  combined <- layer_concatenate(list(stream1, stream2))
+  
+  # Joint processing
+  hidden <- combined |>
+    layer_dense(units = hidden_units[1], activation = "relu") |>
+    layer_batch_normalization() |>
+    layer_dropout(rate = dropout_rate) |>
+    
+    layer_dense(units = hidden_units[2], activation = "relu") |>
+    layer_batch_normalization() |>
+    
+    layer_dense(units = hidden_units[3], activation = "relu")
+  
+  # Output with skip connection
+  # First process input for skip connection
+  skip_processed <- features_input |>
+    layer_dense(units = 1, activation = "linear", use_bias = FALSE)
+  
+  # Main output
+  main_output <- hidden |>
+    layer_dense(units = 1, activation = "linear")
+  
+  # Add skip connection
+  output <- layer_add(list(main_output, skip_processed))
+  
+  # Create and compile model
+  model <- keras_model(inputs = features_input, outputs = output)
+  
+  model |> compile(
+    optimizer = optimizer_adam(learning_rate = learning_rate, clipnorm = 1.0),
+    loss = "mse",
+    metrics = list("mae", "mse")
+  )
+  
+  cat("Hybrid GNN model built successfully with keras3!\n")
+  return(model)
+}
+
+# compare_gnn_models function for keras3
+compare_gnn_models <- function(data, models_to_test = c("simple", "attention", "hybrid"),
+                               n_folds = 5, epochs = 100, batch_size = 32) {
+  
+  cat("\nComparing GNN models with cross-validation using keras3...\n")
+  
+  # Prepare features and target
+  features_df <- data$old_districts |>
+    st_drop_geometry() |>
+    select(urban_density, income_level, education_level, 
+           minority_pct, age_median, population, vote_share_party_a)
+  
+  features_df <- features_df[complete.cases(features_df), ]
+  
+  features <- as.matrix(features_df |> select(-vote_share_party_a))
+  targets <- features_df$vote_share_party_a
+  
+  # Normalize features
+  preproc <- preProcess(features, method = c("center", "scale", "YeoJohnson"))
+  features_scaled <- predict(preproc, features)
+  features_scaled[is.na(features_scaled)] <- 0
+  
+  # Create spatial folds by state 
+  district_ids <- data$old_districts$district_id[
+    complete.cases(data$old_districts |>
+                   st_drop_geometry() |>
+                   select(urban_density, income_level, education_level, 
+                          minority_pct, age_median, population, vote_share_party_a))
+  ]
+  
+  state_codes <- substr(district_ids, 1, 2)
+  unique_states <- unique(state_codes)
+  
+  if(length(unique_states) < n_folds) {
+    n_folds <- length(unique_states)
+    cat("Adjusting to", n_folds, "folds (one per state)\n")
+  }
+  
+  set.seed(42)
+  state_folds <- sample(rep(1:n_folds, length.out = length(unique_states)))
+  fold_assignment <- data.frame(
+    state = unique_states,
+    fold = state_folds
+  )
+  
+  spatial_folds <- fold_assignment$fold[match(state_codes, fold_assignment$state)]
+  
+  # Initialize results
+  results <- list()
+  
+  for(model_type in models_to_test) {
+    cat(sprintf("\n--- Testing %s model ---\n", toupper(model_type)))
+    
+    cv_predictions <- rep(NA, length(targets))
+    fold_metrics <- list()
+    
+    for(fold in 1:n_folds) {
+      cat(sprintf("  Fold %d/%d...\n", fold, n_folds))
+      
+      test_indices <- which(spatial_folds == fold)
+      train_indices <- which(spatial_folds != fold)
+      
+      if(length(train_indices) < 10 || length(test_indices) < 2) {
+        next
+      }
+      
+      # Build appropriate model
+      if(model_type == "simple") {
+        model <- build_simple_gnn(ncol(features_scaled), hidden_units = c(32, 16, 8))
+      } else if(model_type == "attention") {
+        model <- build_attention_gnn(ncol(features_scaled), hidden_units = c(32, 16, 8))
+      } else if(model_type == "hybrid") {
+        model <- build_hybrid_gnn(ncol(features_scaled), hidden_units = c(32, 16, 8))
+      }
+      
+      # Callbacks for keras3
+      early_stop <- callback_early_stopping(
+        monitor = "val_loss",
+        patience = 20,
+        restore_best_weights = TRUE,
+        min_delta = 0.0001
+      )
+      
+      reduce_lr <- callback_reduce_lr_on_plateau(
+        monitor = "val_loss",
+        factor = 0.5,
+        patience = 10,
+        min_lr = 1e-6
+      )
+      
+      # Train model with keras3
+      history <- model |> fit(
+        x = features_scaled[train_indices, , drop = FALSE],
+        y = targets[train_indices],
+        validation_split = 0.2,
+        epochs = epochs,
+        batch_size = batch_size,
+        callbacks = list(early_stop, reduce_lr),
+        verbose = 0
+      )
+      
+      # Predict and clip
+      fold_pred <- predict(model, features_scaled[test_indices, , drop = FALSE])
+      fold_pred <- pmin(pmax(fold_pred, 0.1), 0.9)
+      cv_predictions[test_indices] <- as.vector(fold_pred)
+      
+      # Calculate metrics
+      fold_mae <- mean(abs(fold_pred - targets[test_indices]))
+      fold_rmse <- sqrt(mean((fold_pred - targets[test_indices])^2))
+      fold_r2 <- 1 - sum((targets[test_indices] - fold_pred)^2) / 
+        sum((targets[test_indices] - mean(targets[test_indices]))^2)
+      
+      fold_metrics[[fold]] <- list(
+        mae = fold_mae,
+        rmse = fold_rmse,
+        r2 = fold_r2
+      )
+    }
+    
+    # Calculate overall metrics
+    valid_preds <- !is.na(cv_predictions)
+    if(sum(valid_preds) > 0) {
+      overall_mae <- mean(abs(cv_predictions[valid_preds] - targets[valid_preds]))
+      overall_rmse <- sqrt(mean((cv_predictions[valid_preds] - targets[valid_preds])^2))
+      overall_r2 <- 1 - sum((targets[valid_preds] - cv_predictions[valid_preds])^2) / 
+        sum((targets[valid_preds] - mean(targets[valid_preds]))^2)
+      
+      pred_sd <- sd(cv_predictions[valid_preds])
+      pred_range <- range(cv_predictions[valid_preds])
+      
+      results[[model_type]] <- list(
+        cv_predictions = cv_predictions,
+        metrics = list(
+          mae = overall_mae,
+          rmse = overall_rmse,
+          r2 = overall_r2,
+          pred_sd = pred_sd,
+          pred_range = pred_range
+        ),
+        fold_metrics = fold_metrics
+      )
+      
+      cat(sprintf("  %s model - MAE: %.4f, RMSE: %.4f, R²: %.4f, SD: %.4f\n",
+                  model_type, overall_mae, overall_rmse, overall_r2, pred_sd))
+    }
+  }
+  
+  # Select best model
+  if(length(results) > 0) {
+    maes <- sapply(results, function(x) x$metrics$mae)
+    best_model <- names(which.min(maes))
+    
+    cat(strrep("=", 60), "\n")
+    cat("MODEL COMPARISON RESULTS (keras3)\n")
+    cat(strrep("=", 60), "\n")
+    
+    for(model_name in names(results)) {
+      m <- results[[model_name]]$metrics
+      star <- ifelse(model_name == best_model, " BEST", "")
+      cat(sprintf("%-12s: MAE=%.4f, RMSE=%.4f, R²=%.4f%s\n",
+                  toupper(model_name), m$mae, m$rmse, m$r2, star))
+    }
+    
+    cat("\nSelected best model:", toupper(best_model), "\n")
+  } else {
+    best_model <- "simple"
+    cat("Warning: No valid model results. Using simple model as fallback.\n")
+  }
+  
+  # Train final model on all data
+  cat("\nTraining final", best_model, "model on all data with keras3...\n")
+  
+  if(best_model == "simple") {
+    final_model <- build_simple_gnn(ncol(features_scaled), hidden_units = c(64, 32, 16))
+  } else if(best_model == "attention") {
+    final_model <- build_attention_gnn(ncol(features_scaled), hidden_units = c(64, 32, 16))
+  } else {
+    final_model <- build_hybrid_gnn(ncol(features_scaled), hidden_units = c(64, 32, 16))
+  }
+  
+  # Train final model
+  final_history <- final_model |> fit(
+    x = features_scaled,
+    y = targets,
+    validation_split = 0.1,
+    epochs = 150,
+    batch_size = 32,
+    callbacks = list(
+      callback_early_stopping(patience = 30, restore_best_weights = TRUE),
+      callback_reduce_lr_on_plateau(patience = 15, factor = 0.5)
+    ),
+    verbose = 1
+  )
+  
+  return(list(
+    final_model = final_model,
+    model_comparison = results,
+    best_model_type = best_model,
+    preprocessor = preproc,
+    features_scaled = features_scaled,
+    targets = targets,
+    final_predictions = predict(final_model, features_scaled),
+    history = final_history
+  ))
+}
+```
+
+## PART 4: TRANSFER LEARNING WITH UNCERTAINTY QUANTIFICATION
+
+```{r}
+transfer_to_new_districts <- function(data, trained_model, n_simulations = 50) {
+  
+  cat(strrep("=", 60), "\n")
+  cat("TRANSFER LEARNING TO 119TH CONGRESS DISTRICTS\n")
+  cat(strrep("=", 60), "\n")
+  
+  # 1. Prepare new district features 
+  cat("\n1. Preparing features for new districts...\n")
+  
+  # Get the column names that the preprocessor expects
+  preprocessor_cols <- names(trained_model$preprocessor$mean)
+  if (is.null(preprocessor_cols)) {
+    preprocessor_cols <- names(trained_model$preprocessor$std)
+  }
+  if (is.null(preprocessor_cols)) {
+    # Fallback: get from the preprocessor method
+    if (!is.null(trained_model$preprocessor$method$scale)) {
+      preprocessor_cols <- trained_model$preprocessor$method$scale
+    } else {
+      # Last resort: use column names from training features
+      preprocessor_cols <- colnames(trained_model$features_scaled)
+    }
+  }
+  
+  # If feature_names is empty, use preprocessor_cols
+  if (is.null(trained_model$feature_names) || length(trained_model$feature_names) == 0) {
+    trained_model$feature_names <- preprocessor_cols
+  }
+  
+  cat("   Preprocessor expects columns:", paste(preprocessor_cols, collapse=", "), "\n")
+  cat("   Trained model feature names:", paste(trained_model$feature_names, collapse=", "), "\n")
+  
+  # Check if all required columns are available in new data
+  required_cols <- preprocessor_cols
+  available_cols <- colnames(data$new_districts %>% st_drop_geometry())
+  cat("   Available columns in new districts:", paste(available_cols[1:min(10, length(available_cols))], collapse=", "), "\n")
+  
+  # Extract available features from new districts
+  new_district_data <- data$new_districts %>%
+    st_drop_geometry()
+  
+  # Create empty data frame with preprocessor's column names
+  features_new <- as.data.frame(
+    matrix(0, nrow = nrow(new_district_data), ncol = length(preprocessor_cols))
+  )
+  colnames(features_new) <- preprocessor_cols
+  
+  # Fill in features - map by name, not by position
+  for (col_name in preprocessor_cols) {
+    # Find which feature in trained_model$feature_names corresponds to this column
+    feature_idx <- which(trained_model$feature_names == col_name)
+    if (length(feature_idx) == 0) {
+      # Try to match by removing suffix or checking similar names
+      feature_idx <- grep(paste0("^", col_name), trained_model$feature_names)
+    }
+    
+    if (length(feature_idx) > 0) {
+      feature_name <- trained_model$feature_names[feature_idx[1]]
+      
+      if (feature_name %in% colnames(new_district_data)) {
+        features_new[[col_name]] <- as.numeric(new_district_data[[feature_name]])
+      } else {
+        cat("  Imputing missing feature:", feature_name, "->", col_name, "\n")
+        
+        if (feature_name == "urban_density" && "population" %in% colnames(new_district_data)) {
+          features_new[[col_name]] <- log10(pmax(new_district_data$population, 1000))
+        } else if (feature_name == "minority_pct" && "white_pct" %in% colnames(new_district_data)) {
+          features_new[[col_name]] <- 1 - new_district_data$white_pct
+        } else if (feature_name == "income_level" && "median_income" %in% colnames(new_district_data)) {
+          features_new[[col_name]] <- as.vector(scale(new_district_data$median_income))
+        } else if (feature_name == "education_level" && "college_pct" %in% colnames(new_district_data)) {
+          features_new[[col_name]] <- as.vector(scale(new_district_data$college_pct))
+        } else if (feature_name == "age_median" && "med_age" %in% colnames(new_district_data)) {
+          features_new[[col_name]] <- new_district_data$med_age
+        } else if (feature_name == "population" && "totpop" %in% colnames(new_district_data)) {
+          features_new[[col_name]] <- new_district_data$totpop
+        } else {
+          features_new[[col_name]] <- 0
+        }
+      }
+    } else {
+      # No matching feature found, set to 0
+      cat("  Warning: No match for column", col_name, "in feature names\n")
+      features_new[[col_name]] <- 0
+    }
+  }
+  
+  # 2. Apply preprocessing
+  cat("\n2. Applying feature transformations...\n")
+  
+  # First, make sure features_new has the exact same structure as training data
+  features_new <- features_new[, preprocessor_cols, drop = FALSE]
+  
+  # Apply preprocessing - handle list output
+  features_new_scaled <- predict(trained_model$preprocessor, features_new)
+  
+  # Check if the result is a list and convert to matrix/data.frame
+  if (is.list(features_new_scaled) && !is.data.frame(features_new_scaled)) {
+    cat("   Converting list output to matrix...\n")
+    # Try to extract the scaled data
+    if (!is.null(features_new_scaled$data)) {
+      features_new_scaled <- features_new_scaled$data
+    } else if (is.matrix(features_new_scaled[[1]])) {
+      features_new_scaled <- features_new_scaled[[1]]
+    } else {
+      # Convert list to data frame
+      features_new_scaled <- as.data.frame(features_new_scaled)
+    }
+  }
+  
+  # Ensure we have a matrix for keras
+  features_new_scaled <- as.matrix(features_new_scaled)
+  
+  # Handle any NA/Inf values
+  features_new_scaled[is.na(features_new_scaled)] <- 0
+  features_new_scaled[is.infinite(features_new_scaled)] <- 0
+  
+  cat("   Transformed features dimensions:", dim(features_new_scaled), "\n")
+  
+  # 3. Make GNN predictions
+  cat("\n3. Making GNN predictions...\n")
+  gnn_predictions <- as.vector(predict(trained_model$final_model, features_new_scaled))
+  
+  # Clip to reasonable range
+  gnn_predictions <- pmin(pmax(gnn_predictions, 0.1), 0.9)
+  
+  cat("   GNN prediction range:", round(range(gnn_predictions), 3), "\n")
+  cat("   GNN prediction mean:", round(mean(gnn_predictions), 3), "\n")
+  cat("   GNN prediction SD:", round(sd(gnn_predictions), 3), "\n")
+  
+  # 4. Spatial interpolation as baseline
+  cat("\n4. Calculating spatial baseline predictions...\n")
+  
+  if (!is.null(data$overlap_matrix) && !is.null(data$old_districts$vote_share_party_a)) {
+    old_votes <- data$old_districts$vote_share_party_a
+    old_votes[is.na(old_votes)] <- mean(old_votes, na.rm = TRUE)
+    
+    spatial_predictions <- as.vector(data$overlap_matrix %*% old_votes)
+    spatial_predictions <- pmin(pmax(spatial_predictions, 0.1), 0.9)
+  } else {
+    spatial_predictions <- rep(mean(gnn_predictions), length(gnn_predictions))
+  }
+  
+  # 5. Bootstrap uncertainty estimation
+  cat("\n5. Estimating prediction uncertainty...\n")
+  
+  n_new <- length(gnn_predictions)
+  n_train <- nrow(trained_model$features_scaled)
+  
+  bootstrap_predictions <- matrix(NA, nrow = n_new, ncol = min(n_simulations, 30))
+  
+  for (i in 1:ncol(bootstrap_predictions)) {
+    boot_indices <- sample(1:n_train, size = n_train, replace = TRUE)
+    
+    set.seed(42 + i)
+    boot_model <- build_simple_gnn(
+      n_features = ncol(trained_model$features_scaled),
+      hidden_units = c(32, 16, 8)
+    )
+    
+    boot_model |> fit(
+      x = trained_model$features_scaled[boot_indices, , drop = FALSE],
+      y = trained_model$targets[boot_indices],
+      epochs = 50,
+      batch_size = 32,
+      verbose = 0
+    )
+    
+    boot_pred <- predict(boot_model, features_new_scaled)
+    bootstrap_predictions[, i] <- pmin(pmax(as.vector(boot_pred), 0.1), 0.9)
+    
+    if (i %% 10 == 0) cat("   Completed", i, "bootstrap samples\n")
+  }
+  
+  # Calculate uncertainty metrics
+  prediction_means <- rowMeans(bootstrap_predictions, na.rm = TRUE)
+  prediction_sd <- apply(bootstrap_predictions, 1, sd, na.rm = TRUE)
+  prediction_ci_lower <- apply(bootstrap_predictions, 1, quantile, probs = 0.025, na.rm = TRUE)
+  prediction_ci_upper <- apply(bootstrap_predictions, 1, quantile, probs = 0.975, na.rm = TRUE)
+  
+  # 6. Ensemble prediction (weighted average)
+  gnn_uncertainty <- prediction_sd
+  spatial_uncertainty <- rep(0.05, length(spatial_predictions))
+  
+  gnn_weight <- 1 / (gnn_uncertainty + 0.01)
+  spatial_weight <- 1 / (spatial_uncertainty + 0.01)
+  
+  total_weight <- gnn_weight + spatial_weight
+  gnn_weight <- gnn_weight / total_weight
+  spatial_weight <- spatial_weight / total_weight
+  
+  ensemble_predictions <- gnn_weight * gnn_predictions + spatial_weight * spatial_predictions
+  ensemble_predictions <- pmin(pmax(ensemble_predictions, 0.1), 0.9)
+  
+  # 7. Classification
+  competitive_threshold <- 0.52
+  safe_threshold <- 0.58
+  
+  competitive_mask <- (ensemble_predictions > 0.48 & ensemble_predictions < 0.52)
+  safe_democratic <- ensemble_predictions >= safe_threshold
+  safe_republican <- ensemble_predictions <= (1 - safe_threshold)
+  lean_democratic <- (ensemble_predictions > 0.5 & ensemble_predictions < safe_threshold & !competitive_mask)
+  lean_republican <- (ensemble_predictions < 0.5 & ensemble_predictions > (1 - safe_threshold) & !competitive_mask)
+  
+  # 8. Calculate national summary
+  total_districts <- length(ensemble_predictions)
+  predicted_dem_seats <- sum(ensemble_predictions > 0.5, na.rm = TRUE)
+  predicted_rep_seats <- total_districts - predicted_dem_seats
+  competitive_count <- sum(competitive_mask, na.rm = TRUE)
+  
+  # Display results
+  cat(strrep("=", 60), "\n")
+  cat("TRANSFER LEARNING RESULTS\n")
+  cat(strrep("=", 60), "\n")
+  cat(sprintf("Total districts predicted: %d\n", total_districts))
+  cat(sprintf("Predicted Democratic seats: %d (%.1f%%)\n", 
+              predicted_dem_seats, 100 * predicted_dem_seats / total_districts))
+  cat(sprintf("Predicted Republican seats: %d (%.1f%%)\n", 
+              predicted_rep_seats, 100 * predicted_rep_seats / total_districts))
+  cat(sprintf("Competitive districts (<4%% margin): %d (%.1f%%)\n", 
+              competitive_count, 100 * competitive_count / total_districts))
+  cat(sprintf("Average prediction uncertainty: ±%.2f%%\n", 100 * mean(prediction_sd, na.rm = TRUE)))
+  cat(sprintf("Prediction range: %.1f%% to %.1f%%\n", 
+              100 * min(ensemble_predictions, na.rm = TRUE), 
+              100 * max(ensemble_predictions, na.rm = TRUE)))
+  cat(strrep("=", 60), "\n")
+  
+  # Return comprehensive results
+  return(list(
+    gnn_predictions = gnn_predictions,
+    spatial_predictions = spatial_predictions,
+    ensemble_predictions = ensemble_predictions,
+    uncertainty = list(
+      sd = prediction_sd,
+      ci_lower = prediction_ci_lower,
+      ci_upper = prediction_ci_upper,
+      competitive = competitive_mask,
+      safe_democratic = safe_democratic,
+      safe_republican = safe_republican,
+      lean_democratic = lean_democratic,
+      lean_republican = lean_republican
+    ),
+    national_summary = list(
+      total_districts = total_districts,
+      predicted_dem_seats = predicted_dem_seats,
+      predicted_rep_seats = predicted_rep_seats,
+      competitive_districts = competitive_count,
+      avg_uncertainty = mean(prediction_sd, na.rm = TRUE),
+      min_prediction = min(ensemble_predictions, na.rm = TRUE),
+      max_prediction = max(ensemble_predictions, na.rm = TRUE),
+      median_prediction = median(ensemble_predictions, na.rm = TRUE)
+    ),
+    features_used = preprocessor_cols,
+    model_type = trained_model$best_model_type,
+    feature_mapping = data.frame(
+      preprocessor_col = preprocessor_cols,
+      feature_name = if(length(trained_model$feature_names) > 0) trained_model$feature_names else rep("unknown", length(preprocessor_cols))
+    )
+  ))
+}
+```
+
+## PART 5: VISUALIZATIONS WITH STATE-LEVEL ANALYSIS
+
+```{r}
+create_publication_visualizations <- function(data, model_results, transfer_results, 
+                                              output_dir = "./results/") {
+  
+  cat("\nCreating enhanced visualizations...\n")
+  
+  # Create output directory
+  if(!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  # 1. NATIONAL PREDICTION MAP 
+  cat("1. Creating National Prediction Map...\n")
+  
+  national_data <- data$new_districts %>%
+    mutate(
+      prediction = transfer_results$ensemble_predictions,
+      category = case_when(
+        transfer_results$uncertainty$safe_democratic ~ "Safe Democratic",
+        transfer_results$uncertainty$lean_democratic ~ "Lean Democratic",
+        transfer_results$uncertainty$competitive ~ "Competitive",
+        transfer_results$uncertainty$lean_republican ~ "Lean Republican",
+        transfer_results$uncertainty$safe_republican ~ "Safe Republican",
+        TRUE ~ "Unclassified"
+      ),
+      category = factor(category, levels = c("Safe Democratic", "Lean Democratic", 
+                                            "Competitive", "Lean Republican", 
+                                            "Safe Republican", "Unclassified"))
+    )
+  
+  category_colors <- c(
+    "Safe Democratic" = "#2166AC",
+    "Lean Democratic" = "#67A9CF",
+    "Competitive" = "#F7F7F7",
+    "Lean Republican" = "#EF8A62",
+    "Safe Republican" = "#B2182B",
+    "Unclassified" = "#808080"
+  )
+  
+  p_national <- ggplot(national_data) +
+    geom_sf(aes(fill = category), color = "white", size = 0.1) +
+    scale_fill_manual(values = category_colors, name = "Prediction") +
+    coord_sf(xlim = c(-125, -66), ylim = c(24, 50), expand = FALSE) +
+    labs(
+      title = "Predicted Partisan Lean of 119th Congressional Districts",
+      subtitle = paste("GNN Model:", toupper(transfer_results$model_type),
+                      "| Democratic seats:", sum(national_data$prediction > 0.5),
+                      "| Republican seats:", sum(national_data$prediction <= 0.5)),
+      caption = "Data: RDH, U.S. Census Bureau | Analysis: Graph Neural Network"
+    ) +
+    theme_void() +
+    theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5),
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold")
+    )
+  
+  ggsave(file.path(output_dir, "national_prediction_map.png"), p_national, 
+         width = 14, height = 8, dpi = 300, bg = "white")
+  
+  # 2. MODEL COMPARISON VISUALIZATION
+  cat("2. Creating Model Comparison Visualization...\n")
+  
+  if(!is.null(model_results$model_comparison)) {
+    # Create comparison data frame
+    comparison_df <- map_dfr(names(model_results$model_comparison), function(model_name) {
+      data.frame(
+        Model = toupper(model_name),
+        MAE = model_results$model_comparison[[model_name]]$metrics$mae,
+        RMSE = model_results$model_comparison[[model_name]]$metrics$rmse,
+        R2 = model_results$model_comparison[[model_name]]$metrics$r2,
+        Prediction_SD = model_results$model_comparison[[model_name]]$metrics$pred_sd
+      )
+    })
+    
+    # Best model indicator
+    best_model <- model_results$best_model_type
+    comparison_df$Best <- comparison_df$Model == toupper(best_model)
+    
+    # Create comparison plot
+    p_comparison <- ggplot(comparison_df, aes(x = reorder(Model, -MAE), y = MAE, fill = Best)) +
+      geom_bar(stat = "identity", alpha = 0.8) +
+      geom_text(aes(label = sprintf("%.4f", MAE)), vjust = -0.5, size = 4) +
+      scale_fill_manual(values = c("TRUE" = "#1a9850", "FALSE" = "#4393C3"), guide = "none") +
+      labs(
+        title = "GNN Model Performance Comparison",
+        subtitle = "Mean Absolute Error (MAE)",
+        x = "Model Type",
+        y = "Mean Absolute Error"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(size = 11, face = "bold")
+      )
+    
+    ggsave(file.path(output_dir, "model_comparison.png"), p_comparison, 
+           width = 10, height = 7, dpi = 300)
+  }
+  
+  # 3. STATE-BY-STATE ANALYSIS 
+  cat("3. Creating State-by-State Analysis...\n")
+  
+  # Calculate state-level statistics
+  state_results <- national_data %>%
+    st_drop_geometry() %>%
+    mutate(state_fips = substr(district_id, 1, 2)) %>%
+    group_by(state_fips) %>%
+    summarise(
+      n_districts = n(),
+      avg_prediction = mean(prediction, na.rm = TRUE),
+      predicted_dem = sum(prediction > 0.5, na.rm = TRUE),
+      predicted_rep = n_districts - predicted_dem,
+      dem_share = predicted_dem / n_districts,
+      .groups = "drop"
+    ) %>%
+    arrange(desc(dem_share))
+  
+  # Save state results
+  write_csv(state_results, file.path(output_dir, "state_level_results.csv"))
+  
+  # Create state-level bar chart
+  p_state_summary <- state_results %>%
+    filter(n_districts >= 5) %>%  # Only states with 5+ districts
+    head(20) %>%
+    ggplot(aes(x = reorder(state_fips, dem_share), y = dem_share)) +
+    geom_bar(stat = "identity", aes(fill = dem_share), alpha = 0.7) +
+    scale_fill_gradient2(low = "#B2182B", mid = "#F7F7F7", high = "#2166AC", 
+                        midpoint = 0.5, name = "Democratic Share") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    coord_flip() +
+    labs(
+      title = "Top 20 States by Predicted Democratic Seat Share",
+      subtitle = "States with 5+ congressional districts",
+      x = "State FIPS",
+      y = "Percentage of Democratic Districts"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )
+  
+  ggsave(file.path(output_dir, "state_summary.png"), p_state_summary, 
+         width = 12, height = 8, dpi = 300)
+  
+  # 4. INDIVIDUAL STATE MAPS 
+  cat("4. Creating Individual State Maps...\n")
+  
+  # Get unique states
+  states <- unique(substr(national_data$district_id, 1, 2))
+  
+  # Create a directory for state maps
+  state_maps_dir <- file.path(output_dir, "state_maps")
+  if(!dir.exists(state_maps_dir)) {
+    dir.create(state_maps_dir)
+  }
+  
+  # Create individual state maps
+  for(state in states[1:min(10, length(states))]) {  # Limit to first 10 for speed
+    state_data <- national_data %>%
+      filter(substr(district_id, 1, 2) == state)
+    
+    if(nrow(state_data) > 0) {
+      p_state <- ggplot(state_data) +
+        geom_sf(aes(fill = category), color = "black", size = 0.3) +
+        scale_fill_manual(values = category_colors, name = "Prediction") +
+        labs(
+          title = paste("District Predictions - State", state),
+          subtitle = paste(nrow(state_data), "districts"),
+          caption = paste("Avg prediction:", round(mean(state_data$prediction, na.rm = TRUE), 3))
+        ) +
+        theme_void() +
+        theme(
+          plot.title = element_text(face = "bold", hjust = 0.5),
+          legend.position = "right"
+        )
+      
+      ggsave(file.path(state_maps_dir, paste0("state_", state, "_map.png")), 
+             p_state, width = 8, height = 6, dpi = 300)
+    }
+  }
+  
+  # 5. UNCERTAINTY VISUALIZATION
+  cat("5. Creating Uncertainty Visualization...\n")
+  
+  uncertainty_data <- national_data %>%
+    mutate(uncertainty = transfer_results$uncertainty$sd)
+  
+  p_uncertainty <- ggplot(uncertainty_data, aes(x = prediction, y = uncertainty)) +
+    geom_point(aes(color = category), alpha = 0.7, size = 2) +
+    geom_smooth(method = "loess", se = TRUE, color = "black", size = 0.8) +
+    scale_color_manual(values = category_colors, name = "Category") +
+    scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      title = "Prediction Uncertainty Analysis",
+      subtitle = "Relationship between predicted vote share and uncertainty",
+      x = "Predicted Democratic Vote Share",
+      y = "Prediction Uncertainty (Standard Deviation)",
+      caption = paste("Model:", toupper(transfer_results$model_type))
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      panel.grid.minor = element_blank()
+    )
+  
+  ggsave(file.path(output_dir, "uncertainty_analysis.png"), p_uncertainty, 
+         width = 12, height = 8, dpi = 300)
+  
+  # 6. TRAINING HISTORY VISUALIZATION
+  cat("6. Creating Training History Visualization...\n")
+  
+  if(!is.null(model_results$history)) {
+    history_df <- as.data.frame(model_results$history$metrics)
+    history_df$epoch <- 1:nrow(history_df)
+    
+    p_training <- ggplot(history_df, aes(x = epoch)) +
+      geom_line(aes(y = loss, color = "Training Loss"), size = 1) +
+      geom_line(aes(y = val_loss, color = "Validation Loss"), size = 1) +
+      scale_color_manual(values = c("Training Loss" = "#377EB8", "Validation Loss" = "#E41A1C")) +
+      labs(
+        title = "GNN Training History",
+        subtitle = paste("Best Model:", toupper(model_results$best_model_type)),
+        x = "Epoch",
+        y = "Mean Squared Error Loss",
+        color = "Loss Type"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        legend.position = "bottom"
+      )
+    
+    ggsave(file.path(output_dir, "training_history.png"), p_training, 
+           width = 10, height = 6, dpi = 300)
+  }
+  
+  cat("\n Visualizations created and saved to:", output_dir, "\n")
+  
+  return(list(
+    national_map = p_national,
+    model_comparison = if(exists("p_comparison")) p_comparison else NULL,
+    state_summary = p_state_summary,
+    uncertainty_plot = p_uncertainty,
+    training_plot = if(exists("p_training")) p_training else NULL,
+    national_data = national_data,
+    state_results = state_results
+  ))
+}
+```
+
+## PART 6: RESULTS TABLES
+
+```{r}
+create_results_tables <- function(data, model_results, transfer_results, 
+                                  output_dir = "./results/") {
+  
+  cat("\nGenerating comprehensive results tables...\n")
+  
+  # Ensure output directory exists
+  if(!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  # 1. NATIONAL SUMMARY TABLE
+  national_summary <- data.frame(
+    Metric = c(
+      "Total Congressional Districts",
+      "Best Model Type",
+      "Cross-Validation MAE",
+      "Cross-Validation R²",
+      "Predicted Democratic Seats",
+      "Predicted Republican Seats",
+      "Competitive Districts (<4% margin)",
+      "Average Prediction Uncertainty",
+      "Prediction Range"
+    ),
+    Value = c(
+      sprintf("%d", transfer_results$national_summary$total_districts),
+      toupper(transfer_results$model_type),
+      sprintf("%.4f", model_results$model_comparison[[transfer_results$model_type]]$metrics$mae),
+      sprintf("%.4f", model_results$model_comparison[[transfer_results$model_type]]$metrics$r2),
+      sprintf("%d (%.1f%%)", 
+              transfer_results$national_summary$predicted_dem_seats,
+              100 * transfer_results$national_summary$predicted_dem_seats / 
+                transfer_results$national_summary$total_districts),
+      sprintf("%d (%.1f%%)", 
+              transfer_results$national_summary$predicted_rep_seats,
+              100 * transfer_results$national_summary$predicted_rep_seats / 
+                transfer_results$national_summary$total_districts),
+      sprintf("%d (%.1f%%)", 
+              transfer_results$national_summary$competitive_districts,
+              100 * transfer_results$national_summary$competitive_districts / 
+                transfer_results$national_summary$total_districts),
+      sprintf("±%.2f%%", 100 * transfer_results$national_summary$avg_uncertainty),
+      sprintf("%.1f%% to %.1f%%", 
+              100 * transfer_results$national_summary$min_prediction,
+              100 * transfer_results$national_summary$max_prediction)
+    )
+  )
+  
+  write_csv(national_summary, file.path(output_dir, "national_summary.csv"))
+  
+  # 2. DISTRICT-LEVEL PREDICTIONS
+  district_predictions <- data$new_districts %>%
+    st_drop_geometry() %>%
+    select(district_id, state_fips) %>%
+    mutate(
+      prediction = transfer_results$ensemble_predictions,
+      uncertainty = transfer_results$uncertainty$sd,
+      category = case_when(
+        transfer_results$uncertainty$safe_democratic ~ "Safe Democratic",
+        transfer_results$uncertainty$lean_democratic ~ "Lean Democratic",
+        transfer_results$uncertainty$competitive ~ "Competitive",
+        transfer_results$uncertainty$lean_republican ~ "Lean Republican",
+        transfer_results$uncertainty$safe_republican ~ "Safe Republican",
+        TRUE ~ "Unclassified"
+      )
+    ) %>%
+    arrange(state_fips, district_id)
+  
+  write_csv(district_predictions, file.path(output_dir, "district_predictions.csv"))
+  
+  # 3. MODEL COMPARISON TABLE
+  if(!is.null(model_results$model_comparison)) {
+    model_comparison <- map_dfr(names(model_results$model_comparison), function(model_name) {
+      m <- model_results$model_comparison[[model_name]]$metrics
+      data.frame(
+        Model = toupper(model_name),
+        MAE = m$mae,
+        RMSE = m$rmse,
+        R2 = m$r2,
+        Prediction_SD = m$pred_sd,
+        Min_Prediction = m$pred_range[1],
+        Max_Prediction = m$pred_range[2],
+        Is_Best = model_name == model_results$best_model_type
+      )
+    })
+    
+    write_csv(model_comparison, file.path(output_dir, "model_comparison.csv"))
+  }
+  
+  cat(" Results tables saved to:", output_dir, "\n")
+  
+  return(list(
+    national_summary = national_summary,
+    district_predictions = district_predictions,
+    model_comparison = if(exists("model_comparison")) model_comparison else NULL
+  ))
+}
+```
+
+## PART 7: COMPLETE ANALYSIS PIPELINE
+
+```{r}
+run_complete_national_analysis <- function(data_path = "./national_data/",
+                                         output_dir = "./analysis_results/",
+                                         use_rdh_election_data = TRUE,
+                                         n_simulations = 30,
+                                         test_mode = FALSE) {
+  
+  # Create output directory
+  if(!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+    cat("Created output directory:", output_dir, "\n")
+  }
+  
+  cat("\n")
+  cat("\n")
+  cat("         NATIONAL REDISTRICTING ANALYSIS WITH GNN COMPARISON        \n")
+  cat("\n\n")
+  
+  # Step 1: Load data
+  cat("STEP 1: Loading national redistricting data...\n")
+  redistricting_data <- load_national_redistricting_data(
+    data_path = data_path,
+    use_rdh_election_data = use_rdh_election_data
+  )
+  
+  # Step 2: EDA
+  cat("\nSTEP 2: Exploratory data analysis...\n")
+  eda_results <- perform_comprehensive_eda(redistricting_data)
+  
+  # Step 3: Train and compare GNN models
+  cat("\nSTEP 3: Training and comparing GNN models...\n")
+  gnn_results <- compare_gnn_models(
+    data = redistricting_data,
+    models_to_test = c("simple", "attention", "hybrid"),
+    n_folds = 5,
+    epochs = 100
+  )
+  
+  # Step 4: Transfer learning
+  cat("\nSTEP 4: Transfer learning to new districts...\n")
+  transfer_results <- transfer_to_new_districts(
+    data = redistricting_data,
+    trained_model = gnn_results,
+    n_simulations = n_simulations
+  )
+  
+  # Step 5: Create visualizations
+  cat("\nSTEP 5: Creating visualizations...\n")
+  visualizations <- create_publication_visualizations(
+    data = redistricting_data,
+    model_results = gnn_results,
+    transfer_results = transfer_results,
+    output_dir = output_dir
+  )
+  
+  # Step 6: Generate results tables
+  cat("\nSTEP 6: Generating results tables...\n")
+  tables <- create_results_tables(
+    data = redistricting_data,
+    model_results = gnn_results,
+    transfer_results = transfer_results,
+    output_dir = output_dir
+  )
+  
+  # Compile all results
+  final_results <- list(
+    data = redistricting_data,
+    eda_results = eda_results,
+    gnn_results = gnn_results,
+    transfer_results = transfer_results,
+    visualizations = visualizations,
+    tables = tables
+  )
+  
+  # Save complete results
+  saveRDS(final_results, file.path(output_dir, "complete_analysis_results.rds"))
+  
+  # Display summary
+  cat("\n")
+  cat(strrep("=", 70), "\n")
+  cat("ANALYSIS COMPLETE\n")
+  cat(strrep("=", 70), "\n")
+  cat(sprintf("Best model: %s\n", toupper(gnn_results$best_model_type)))
+  cat(sprintf("CV MAE: %.4f\n", gnn_results$model_comparison[[gnn_results$best_model_type]]$metrics$mae))
+  cat(sprintf("Predicted Democratic seats: %d\n", transfer_results$national_summary$predicted_dem_seats))
+  cat(sprintf("Predicted Republican seats: %d\n", transfer_results$national_summary$predicted_rep_seats))
+  cat(sprintf("Output directory: %s\n", output_dir))
+  cat(strrep("=", 70), "\n")
+  
+  return(final_results)
+}
+```
+
+## Execution
+
+```{r}
+results <- run_complete_national_analysis(
+  data_path = "./national_data/",
+  output_dir = "./new_results_1/",
+  use_rdh_election_data = FALSE,
+  n_simulations = 50
+)
+```
+

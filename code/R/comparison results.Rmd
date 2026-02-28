@@ -1,0 +1,1188 @@
+---
+title: "Cross-District Electoral Forecasting via Graph Neural Networks with Uncertainty-Aware Transfer Learning: A Comprehensive Framework for Redistricting Analysis"
+output: html_document
+date: ""
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Model Comparaison
+
+## Set output directory for all results
+
+```{r}
+RESULTS_DIR <- "./comprehensive_comparison_results/"
+dir.create(RESULTS_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(RESULTS_DIR, "plots"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(RESULTS_DIR, "tables"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(RESULTS_DIR, "models"), showWarnings = FALSE, recursive = TRUE)
+```
+
+## Library Loading and Setup
+
+```{r}
+# Core spatial and data manipulation
+library(sf)
+library(spdep)
+library(Matrix)
+library(igraph)
+library(tidyverse)
+library(tidycensus)
+
+# Machine Learning
+library(caret)
+library(xgboost)
+library(randomForest)
+library(ranger)
+library(keras3)
+
+# Spatial statistics
+library(gstat)
+library(geostan)
+library(INLA)
+library(spatialreg)
+
+# Visualization
+library(ggplot2)
+library(viridis)
+library(patchwork)
+library(gridExtra)
+library(gt)
+library(scales)
+
+# Performance
+library(tictoc)
+library(doParallel)
+
+# Image processing for CNN
+library(OpenImageR)
+library(magick)
+
+set.seed(42)
+
+cat("All libraries loaded successfully.\n")
+cat("Results will be saved to:", RESULTS_DIR, "\n")
+```
+
+## COMPLETE DATA LOADING FUNCTION
+
+same function `load_national_redistricting_data` from `First version before reviewing.Rmd`
+
+```{r}
+# Load the national data
+national_data <- load_national_redistricting_data(
+  data_path = "./national_data/",
+  use_rdh_election_data = TRUE
+)
+
+cat("\nData loading complete!\n")
+cat("Old districts:", nrow(national_data$old_districts), "\n")
+cat("New districts:", nrow(national_data$new_districts), "\n")
+```
+
+## Method 1: GNN Models (Our Approach)
+
+same functions `build_simple_gnn`, `build_attention_gnn` and `build_hybrid_gnn` from `First version before reviewing.Rmd`
+
+## Method 2: Gradient Boosting with Spatial Lag
+
+```{r gradient_boosting_spatial}
+train_xgboost_spatial_lag <- function(features, targets, adj_matrix, 
+                                      n_folds = 5, n_rounds = 500) {
+  
+  cat("\n=== Training XGBoost with Spatial Lag ===\n")
+  
+  # Add spatial lag features
+  W <- adj_matrix / rowSums(adj_matrix)  # Row-normalize
+  spatial_lag <- W %*% targets
+  
+  features_augmented <- cbind(features, spatial_lag = as.vector(spatial_lag))
+  
+  # Cross-validation
+  cv_predictions <- rep(NA, length(targets))
+  folds <- createFolds(targets, k = n_folds, list = TRUE)
+  
+  for(fold_idx in seq_along(folds)) {
+    cat(sprintf("  Fold %d/%d...\n", fold_idx, length(folds)))
+    
+    test_indices <- folds[[fold_idx]]
+    train_indices <- setdiff(1:length(targets), test_indices)
+    
+    dtrain <- xgb.DMatrix(
+      data = features_augmented[train_indices, ],
+      label = targets[train_indices]
+    )
+    
+    dtest <- xgb.DMatrix(
+      data = features_augmented[test_indices, ],
+      label = targets[test_indices]
+    )
+    
+    params <- list(
+      objective = "reg:squarederror",
+      eta = 0.05,
+      max_depth = 6,
+      min_child_weight = 3,
+      subsample = 0.8,
+      colsample_bytree = 0.8,
+      gamma = 0.1
+    )
+    
+    model <- xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = n_rounds,
+      watchlist = list(train = dtrain, test = dtest),
+      early_stopping_rounds = 50,
+      verbose = 0
+    )
+    
+    cv_predictions[test_indices] <- predict(model, dtest)
+  }
+  
+  # Clip predictions
+  cv_predictions <- pmin(pmax(cv_predictions, 0.1), 0.9)
+  
+  # Calculate metrics
+  mae <- mean(abs(cv_predictions - targets), na.rm = TRUE)
+  rmse <- sqrt(mean((cv_predictions - targets)^2, na.rm = TRUE))
+  r2 <- 1 - sum((targets - cv_predictions)^2, na.rm = TRUE) / 
+    sum((targets - mean(targets))^2)
+  
+  cat(sprintf("XGBoost Spatial: MAE=%.4f, RMSE=%.4f, R²=%.4f\n", mae, rmse, r2))
+  
+  # Train final model on all data
+  dtrain_full <- xgb.DMatrix(data = features_augmented, label = targets)
+  
+  # Get best iteration or use default
+  best_iter <- if(!is.null(model$best_iteration)) model$best_iteration else n_rounds
+  
+  final_model <- xgb.train(
+    params = params,
+    data = dtrain_full,
+    nrounds = best_iter,
+    verbose = 0
+  )
+  
+  return(list(
+    model = final_model,
+    cv_predictions = cv_predictions,
+    metrics = list(mae = mae, rmse = rmse, r2 = r2),
+    feature_importance = xgb.importance(model = final_model)
+  ))
+}
+```
+
+## Method 3: Random Forest with Spatial KNN
+
+```{r random_forest_spatial}
+train_random_forest_spatial <- function(features, targets, adj_matrix, 
+                                       n_folds = 5, ntree = 500) {
+  
+  cat("\n=== Training Random Forest with Spatial KNN ===\n")
+  
+  # Calculate spatial KNN features (k=5)
+  W <- adj_matrix / rowSums(adj_matrix)
+  
+  # Add multiple spatial lag orders
+  spatial_lag1 <- as.vector(W %*% targets)
+  spatial_lag2 <- as.vector(W %*% W %*% targets)
+  knn_mean <- spatial_lag1
+  knn_sd <- apply(W, 1, function(w) {
+    neighbors <- which(w > 0)
+    if(length(neighbors) > 0) {
+      return(sd(targets[neighbors]))
+    } else {
+      return(0)
+    }
+  })
+  
+  features_augmented <- cbind(
+    features, 
+    spatial_lag1 = spatial_lag1,
+    spatial_lag2 = spatial_lag2,
+    knn_mean = knn_mean,
+    knn_sd = knn_sd
+  )
+  
+  # Cross-validation
+  cv_predictions <- rep(NA, length(targets))
+  folds <- createFolds(targets, k = n_folds, list = TRUE)
+  
+  for(fold_idx in seq_along(folds)) {
+    cat(sprintf("  Fold %d/%d...\n", fold_idx, length(folds)))
+    
+    test_indices <- folds[[fold_idx]]
+    train_indices <- setdiff(1:length(targets), test_indices)
+    
+    rf_model <- ranger(
+      y = targets[train_indices],
+      x = features_augmented[train_indices, ],
+      num.trees = ntree,
+      mtry = floor(sqrt(ncol(features_augmented))),
+      min.node.size = 5,
+      importance = "impurity",
+      seed = 42
+    )
+    
+    cv_predictions[test_indices] <- predict(
+      rf_model, 
+      data = features_augmented[test_indices, ]
+    )$predictions
+  }
+  
+  # Clip predictions
+  cv_predictions <- pmin(pmax(cv_predictions, 0.1), 0.9)
+  
+  # Calculate metrics
+  mae <- mean(abs(cv_predictions - targets), na.rm = TRUE)
+  rmse <- sqrt(mean((cv_predictions - targets)^2, na.rm = TRUE))
+  r2 <- 1 - sum((targets - cv_predictions)^2, na.rm = TRUE) / 
+    sum((targets - mean(targets))^2)
+  
+  cat(sprintf("Random Forest Spatial: MAE=%.4f, RMSE=%.4f, R²=%.4f\n", mae, rmse, r2))
+  
+  # Train final model
+  final_model <- ranger(
+    y = targets,
+    x = features_augmented,
+    num.trees = ntree,
+    mtry = floor(sqrt(ncol(features_augmented))),
+    importance = "impurity",
+    seed = 42
+  )
+  
+  return(list(
+    model = final_model,
+    cv_predictions = cv_predictions,
+    metrics = list(mae = mae, rmse = rmse, r2 = r2),
+    feature_importance = importance(final_model)
+  ))
+}
+```
+
+## Method 4: Dense Neural Network with Aggregated Features
+
+```{r dense_nn}
+train_dense_nn_aggregated <- function(features, targets, adj_matrix,
+                                     n_folds = 5, epochs = 150) {
+  
+  cat("\n=== Training Dense NN with Aggregated Features ===\n")
+  
+  # Create aggregated spatial features
+  W <- adj_matrix / rowSums(adj_matrix)
+  
+  # Aggregate features from neighbors
+  spatial_mean <- W %*% features
+  spatial_max <- t(apply(W, 1, function(w) {
+    apply(features, 2, function(feat) max(feat[w > 0]))
+  }))
+  spatial_min <- t(apply(W, 1, function(w) {
+    apply(features, 2, function(feat) min(feat[w > 0]))
+  }))
+  
+  features_aggregated <- cbind(
+    features,
+    spatial_mean,
+    spatial_max,
+    spatial_min
+  )
+  
+  # Normalize
+  preproc <- preProcess(features_aggregated, method = c("center", "scale"))
+  features_scaled <- predict(preproc, features_aggregated)
+  
+  # Cross-validation
+  cv_predictions <- rep(NA, length(targets))
+  folds <- createFolds(targets, k = n_folds, list = TRUE)
+  
+  for(fold_idx in seq_along(folds)) {
+    cat(sprintf("  Fold %d/%d...\n", fold_idx, length(folds)))
+    
+    test_indices <- folds[[fold_idx]]
+    train_indices <- setdiff(1:length(targets), test_indices)
+    
+    model <- keras_model_sequential() %>%
+      layer_dense(units = 128, activation = "relu", 
+                  input_shape = ncol(features_scaled)) %>%
+      layer_batch_normalization() %>%
+      layer_dropout(rate = 0.3) %>%
+      layer_dense(units = 64, activation = "relu") %>%
+      layer_batch_normalization() %>%
+      layer_dropout(rate = 0.3) %>%
+      layer_dense(units = 32, activation = "relu") %>%
+      layer_batch_normalization() %>%
+      layer_dropout(rate = 0.2) %>%
+      layer_dense(units = 1, activation = "linear")
+    
+    model %>% compile(
+      optimizer = optimizer_adam(learning_rate = 0.001),
+      loss = "mse",
+      metrics = list("mae")
+    )
+    
+    history <- model %>% fit(
+      x = features_scaled[train_indices, ],
+      y = targets[train_indices],
+      epochs = epochs,
+      batch_size = 32,
+      validation_split = 0.2,
+      callbacks = list(
+        callback_early_stopping(patience = 20, restore_best_weights = TRUE)
+      ),
+      verbose = 0
+    )
+    
+    cv_predictions[test_indices] <- as.vector(
+      predict(model, features_scaled[test_indices, ])
+    )
+  }
+  
+  # Clip predictions
+  cv_predictions <- pmin(pmax(cv_predictions, 0.1), 0.9)
+  
+  # Calculate metrics
+  mae <- mean(abs(cv_predictions - targets), na.rm = TRUE)
+  rmse <- sqrt(mean((cv_predictions - targets)^2, na.rm = TRUE))
+  r2 <- 1 - sum((targets - cv_predictions)^2, na.rm = TRUE) / 
+    sum((targets - mean(targets))^2)
+  
+  cat(sprintf("Dense NN Aggregated: MAE=%.4f, RMSE=%.4f, R²=%.4f\n", mae, rmse, r2))
+  
+  # Train final model
+  final_model <- keras_model_sequential() %>%
+    layer_dense(units = 128, activation = "relu", 
+                input_shape = ncol(features_scaled)) %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 64, activation = "relu") %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = 0.2) %>%
+    layer_dense(units = 1, activation = "linear")
+  
+  final_model %>% compile(
+    optimizer = optimizer_adam(learning_rate = 0.001),
+    loss = "mse",
+    metrics = list("mae")
+  )
+  
+  final_model %>% fit(
+    x = features_scaled,
+    y = targets,
+    epochs = epochs,
+    batch_size = 32,
+    validation_split = 0.1,
+    verbose = 0
+  )
+  
+  return(list(
+    model = final_model,
+    preprocessor = preproc,
+    cv_predictions = cv_predictions,
+    metrics = list(mae = mae, rmse = rmse, r2 = r2)
+  ))
+}
+```
+
+## Method 5: Spatial Bayesian Hierarchical Model
+
+```{r spatial_bayesian}
+train_spatial_bayesian <- function(features, targets, adj_matrix, 
+                                  spatial_data, n_folds = 5) {
+  
+  cat("\n=== Training Spatial Bayesian Model ===\n")
+  
+  # Prepare data
+  model_data <- as.data.frame(features)
+  model_data$target <- targets
+  model_data$district_id <- 1:nrow(features)
+  
+  # Create spatial weights
+  nb_list <- mat2listw(adj_matrix, style = "B")
+  
+  cv_predictions <- rep(NA, length(targets))
+  folds <- createFolds(targets, k = n_folds, list = TRUE)
+  
+  for(fold_idx in seq_along(folds)) {
+    cat(sprintf("  Fold %d/%d...\n", fold_idx, length(folds)))
+    
+    test_indices <- folds[[fold_idx]]
+    train_indices <- setdiff(1:length(targets), test_indices)
+    
+    tryCatch({
+      # Fit SAR model (Spatial Autoregressive)
+      train_data <- model_data[train_indices, ]
+      test_data <- model_data[test_indices, ]
+      
+      # Create subset adjacency matrix
+      train_adj <- adj_matrix[train_indices, train_indices]
+      train_nb <- mat2listw(train_adj, style = "W")
+      
+      formula_str <- paste("target ~", paste(colnames(features), collapse = " + "))
+      
+      sar_model <- lagsarlm(
+        as.formula(formula_str),
+        data = train_data,
+        listw = train_nb,
+        zero.policy = TRUE,
+        tol.solve = 1e-10
+      )
+      
+      # Predict (simplified - no spatial component for out-of-sample)
+      X_test <- as.matrix(cbind(1, test_data[, colnames(features)]))
+      cv_predictions[test_indices] <- X_test %*% coef(sar_model)
+      
+    }, error = function(e) {
+      cat("    Warning: SAR failed, using linear model\n")
+      lm_model <- lm(as.formula(formula_str), data = train_data)
+      cv_predictions[test_indices] <<- predict(lm_model, newdata = test_data)
+    })
+  }
+  
+  # Clip predictions
+  cv_predictions <- pmin(pmax(cv_predictions, 0.1), 0.9)
+  
+  # Calculate metrics
+  mae <- mean(abs(cv_predictions - targets), na.rm = TRUE)
+  rmse <- sqrt(mean((cv_predictions - targets)^2, na.rm = TRUE))
+  r2 <- 1 - sum((targets - cv_predictions)^2, na.rm = TRUE) / 
+    sum((targets - mean(targets))^2)
+  
+  cat(sprintf("Spatial Bayesian: MAE=%.4f, RMSE=%.4f, R²=%.4f\n", mae, rmse, r2))
+  
+  # Train final model on all data
+  formula_str <- paste("target ~", paste(colnames(features), collapse = " + "))
+  final_model <- lagsarlm(
+    as.formula(formula_str),
+    data = model_data,
+    listw = nb_list,
+    zero.policy = TRUE
+  )
+  
+  return(list(
+    model = final_model,
+    cv_predictions = cv_predictions,
+    metrics = list(mae = mae, rmse = rmse, r2 = r2)
+  ))
+}
+```
+
+## Method 6: CNN on District Maps
+
+```{r cnn_maps}
+create_district_images <- function(spatial_data, features, image_size = 64) {
+  
+  cat("\n=== Creating District Map Images ===\n")
+  
+  n_districts <- nrow(spatial_data)
+  n_features <- ncol(features)
+  
+  # Create image array: (n_districts, height, width, channels)
+  image_array <- array(0, dim = c(n_districts, image_size, image_size, n_features))
+  
+  for(i in 1:n_districts) {
+    district_geom <- spatial_data[i, ]
+    bbox <- st_bbox(district_geom)
+    
+    # Create raster for each feature
+    for(f in 1:n_features) {
+      # Simple rasterization: fill with feature value
+      img <- matrix(features[i, f], nrow = image_size, ncol = image_size)
+      
+      # Add some spatial structure (simple gradient)
+      x_grad <- matrix(rep(seq(0, 1, length.out = image_size), image_size), 
+                       nrow = image_size, byrow = TRUE)
+      y_grad <- matrix(rep(seq(0, 1, length.out = image_size), image_size), 
+                       nrow = image_size, byrow = FALSE)
+      
+      img <- img * (1 + 0.1 * (x_grad + y_grad) / 2)
+      image_array[i, , , f] <- img
+    }
+    
+    if(i %% 50 == 0) cat(sprintf("  Processed %d/%d districts\n", i, n_districts))
+  }
+  
+  # Normalize images
+  for(f in 1:n_features) {
+    channel <- image_array[, , , f]
+    image_array[, , , f] <- (channel - mean(channel)) / (sd(channel) + 1e-6)
+  }
+  
+  return(image_array)
+}
+
+train_cnn_maps <- function(images, targets, n_folds = 5, epochs = 100) {
+  
+  cat("\n=== Training CNN on District Maps ===\n")
+  
+  cv_predictions <- rep(NA, length(targets))
+  folds <- createFolds(targets, k = n_folds, list = TRUE)
+  
+  for(fold_idx in seq_along(folds)) {
+    cat(sprintf("  Fold %d/%d...\n", fold_idx, length(folds)))
+    
+    test_indices <- folds[[fold_idx]]
+    train_indices <- setdiff(1:length(targets), test_indices)
+    
+    model <- keras_model_sequential() %>%
+      layer_conv_2d(filters = 32, kernel_size = c(3, 3), activation = "relu",
+                    input_shape = dim(images)[2:4]) %>%
+      layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+      layer_conv_2d(filters = 64, kernel_size = c(3, 3), activation = "relu") %>%
+      layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+      layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>%
+      layer_global_average_pooling_2d() %>%
+      layer_dense(units = 128, activation = "relu") %>%
+      layer_dropout(rate = 0.3) %>%
+      layer_dense(units = 64, activation = "relu") %>%
+      layer_dropout(rate = 0.2) %>%
+      layer_dense(units = 1, activation = "linear")
+    
+    model %>% compile(
+      optimizer = optimizer_adam(learning_rate = 0.001),
+      loss = "mse",
+      metrics = list("mae")
+    )
+    
+    history <- model %>% fit(
+      x = images[train_indices, , , ],
+      y = targets[train_indices],
+      epochs = epochs,
+      batch_size = 16,
+      validation_split = 0.2,
+      callbacks = list(
+        callback_early_stopping(patience = 15, restore_best_weights = TRUE)
+      ),
+      verbose = 0
+    )
+    
+    cv_predictions[test_indices] <- as.vector(
+      predict(model, images[test_indices, , , ])
+    )
+  }
+  
+  # Clip predictions
+  cv_predictions <- pmin(pmax(cv_predictions, 0.1), 0.9)
+  
+  # Calculate metrics
+  mae <- mean(abs(cv_predictions - targets), na.rm = TRUE)
+  rmse <- sqrt(mean((cv_predictions - targets)^2, na.rm = TRUE))
+  r2 <- 1 - sum((targets - cv_predictions)^2, na.rm = TRUE) / 
+    sum((targets - mean(targets))^2)
+  
+  cat(sprintf("CNN Maps: MAE=%.4f, RMSE=%.4f, R²=%.4f\n", mae, rmse, r2))
+  
+  # Train final model
+  final_model <- keras_model_sequential() %>%
+    layer_conv_2d(filters = 32, kernel_size = c(3, 3), activation = "relu",
+                  input_shape = dim(images)[2:4]) %>%
+    layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+    layer_conv_2d(filters = 64, kernel_size = c(3, 3), activation = "relu") %>%
+    layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+    layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>%
+    layer_global_average_pooling_2d() %>%
+    layer_dense(units = 128, activation = "relu") %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 64, activation = "relu") %>%
+    layer_dropout(rate = 0.2) %>%
+    layer_dense(units = 1, activation = "linear")
+  
+  final_model %>% compile(
+    optimizer = optimizer_adam(learning_rate = 0.001),
+    loss = "mse",
+    metrics = list("mae")
+  )
+  
+  final_model %>% fit(
+    x = images,
+    y = targets,
+    epochs = epochs,
+    batch_size = 16,
+    validation_split = 0.1,
+    verbose = 0
+  )
+  
+  return(list(
+    model = final_model,
+    cv_predictions = cv_predictions,
+    metrics = list(mae = mae, rmse = rmse, r2 = r2)
+  ))
+}
+```
+
+## Method 7: Baseline Areal Interpolation
+
+```{r areal_interpolation}
+# ============================================================================
+# BASELINE: AREAL INTERPOLATION
+# ============================================================================
+
+train_areal_interpolation <- function(targets, overlap_matrix, n_folds = 5) {
+  
+  cat("\n=== Baseline: Areal Interpolation ===\n")
+
+  cv_predictions <- rep(NA, length(targets))
+  folds <- createFolds(targets, k = n_folds, list = TRUE)
+  
+  for(fold_idx in seq_along(folds)) {
+    test_indices <- folds[[fold_idx]]
+    train_indices <- setdiff(1:length(targets), test_indices)
+    
+    # For each test district, use overlap with training districts
+    for(test_idx in test_indices) {
+      weights <- overlap_matrix[test_idx, train_indices]
+      weights <- weights / sum(weights)
+      cv_predictions[test_idx] <- sum(weights * targets[train_indices])
+    }
+  }
+  
+  # Clip predictions
+  cv_predictions <- pmin(pmax(cv_predictions, 0.1), 0.9)
+  
+  # Calculate metrics
+  mae <- mean(abs(cv_predictions - targets), na.rm = TRUE)
+  rmse <- sqrt(mean((cv_predictions - targets)^2, na.rm = TRUE))
+  r2 <- 1 - sum((targets - cv_predictions)^2, na.rm = TRUE) / 
+    sum((targets - mean(targets))^2)
+  
+  cat(sprintf("Areal Interpolation: MAE=%.4f, RMSE=%.4f, R²=%.4f\n", mae, rmse, r2))
+  
+  return(list(
+    cv_predictions = cv_predictions,
+    metrics = list(mae = mae, rmse = rmse, r2 = r2)
+  ))
+}
+```
+
+## Run All Comparisons
+
+```{r run_all_comparisons, cache=TRUE}
+cat("\n", strrep("=", 70), "\n")
+cat("RUNNING COMPREHENSIVE METHOD COMPARISON\n")
+cat(strrep("=", 70), "\n\n")
+
+# Prepare features and targets
+old_data <- national_data$old_districts %>% st_drop_geometry()
+
+features <- old_data %>%
+  select(urban_density, income_level, education_level, 
+         minority_pct, age_median) %>%
+  as.matrix()
+
+# Remove rows with NA in targets
+valid_rows <- !is.na(old_data$vote_share_party_a)
+features <- features[valid_rows, ]
+targets <- old_data$vote_share_party_a[valid_rows]
+adj_matrix <- national_data$adj_matrix_old[valid_rows, valid_rows]
+overlap_matrix <- national_data$overlap_matrix[, valid_rows]
+
+cat("Using", sum(valid_rows), "districts with complete data.\n")
+cat("Features:", ncol(features), "\n")
+cat("Feature names:", paste(colnames(features), collapse = ", "), "\n\n")
+
+# Standardize features for neural networks
+preproc <- preProcess(features, method = c("center", "scale"))
+features_scaled <- predict(preproc, features)
+
+# Store all results
+all_results <- list()
+
+# ============================================================================
+# 1. GNN MODELS (OUR APPROACH)
+# ============================================================================
+
+cat("\n### TESTING GNN MODELS ###\n")
+
+# Simple GNN
+tic("Simple GNN")
+gnn_simple <- build_simple_gnn(ncol(features_scaled))
+gnn_simple %>% fit(
+  x = features_scaled,
+  y = targets,
+  epochs = 100,
+  batch_size = 32,
+  validation_split = 0.2,
+  verbose = 0
+)
+gnn_simple_pred <- as.vector(predict(gnn_simple, features_scaled))
+gnn_simple_pred <- pmin(pmax(gnn_simple_pred, 0.1), 0.9)
+all_results$gnn_simple <- list(
+  predictions = gnn_simple_pred,
+  metrics = list(
+    mae = mean(abs(gnn_simple_pred - targets)),
+    rmse = sqrt(mean((gnn_simple_pred - targets)^2)),
+    r2 = 1 - sum((targets - gnn_simple_pred)^2) / sum((targets - mean(targets))^2)
+  )
+)
+toc()
+
+# Attention GNN
+tic("Attention GNN")
+gnn_attention <- build_attention_gnn(ncol(features_scaled))
+gnn_attention %>% fit(
+  x = features_scaled,
+  y = targets,
+  epochs = 100,
+  batch_size = 32,
+  validation_split = 0.2,
+  verbose = 0
+)
+gnn_attention_pred <- as.vector(predict(gnn_attention, features_scaled))
+gnn_attention_pred <- pmin(pmax(gnn_attention_pred, 0.1), 0.9)
+all_results$gnn_attention <- list(
+  predictions = gnn_attention_pred,
+  metrics = list(
+    mae = mean(abs(gnn_attention_pred - targets)),
+    rmse = sqrt(mean((gnn_attention_pred - targets)^2)),
+    r2 = 1 - sum((targets - gnn_attention_pred)^2) / sum((targets - mean(targets))^2)
+  )
+)
+toc()
+
+# Hybrid GNN
+tic("Hybrid GNN")
+gnn_hybrid <- build_hybrid_gnn(ncol(features_scaled))
+gnn_hybrid %>% fit(
+  x = features_scaled,
+  y = targets,
+  epochs = 100,
+  batch_size = 32,
+  validation_split = 0.2,
+  verbose = 0
+)
+gnn_hybrid_pred <- as.vector(predict(gnn_hybrid, features_scaled))
+gnn_hybrid_pred <- pmin(pmax(gnn_hybrid_pred, 0.1), 0.9)
+all_results$gnn_hybrid <- list(
+  predictions = gnn_hybrid_pred,
+  metrics = list(
+    mae = mean(abs(gnn_hybrid_pred - targets)),
+    rmse = sqrt(mean((gnn_hybrid_pred - targets)^2)),
+    r2 = 1 - sum((targets - gnn_hybrid_pred)^2) / sum((targets - mean(targets))^2)
+  )
+)
+toc()
+
+# ============================================================================
+# 2. GRADIENT BOOSTING WITH SPATIAL LAG
+# ============================================================================
+
+tic("XGBoost Spatial")
+all_results$xgboost_spatial <- train_xgboost_spatial_lag(
+  features, targets, adj_matrix
+)
+toc()
+
+# ============================================================================
+# 3. RANDOM FOREST WITH SPATIAL KNN
+# ============================================================================
+
+tic("Random Forest Spatial")
+all_results$rf_spatial <- train_random_forest_spatial(
+  features, targets, adj_matrix
+)
+toc()
+
+# ============================================================================
+# 4. DENSE NN WITH AGGREGATED FEATURES
+# ============================================================================
+
+tic("Dense NN Aggregated")
+all_results$dense_nn <- train_dense_nn_aggregated(
+  features, targets, adj_matrix
+)
+toc()
+
+# ============================================================================
+# 5. SPATIAL BAYESIAN
+# ============================================================================
+
+tic("Spatial Bayesian")
+all_results$spatial_bayesian <- train_spatial_bayesian(
+  features, targets, adj_matrix,
+  national_data$old_districts[valid_rows, ]
+)
+toc()
+
+# ============================================================================
+# 6. CNN ON MAPS
+# ============================================================================
+
+tic("Creating district images")
+district_images <- create_district_images(
+  national_data$old_districts[valid_rows, ],
+  features,
+  image_size = 32  
+)
+toc()
+
+tic("CNN Maps")
+all_results$cnn_maps <- train_cnn_maps(
+  district_images, targets
+)
+toc()
+
+# ============================================================================
+# 7. BASELINE: AREAL INTERPOLATION
+# ============================================================================
+
+tic("Areal Interpolation")
+all_results$areal_interpolation <- train_areal_interpolation(
+  targets, overlap_matrix
+)
+toc()
+
+cat("\n", strrep("=", 70), "\n")
+cat("ALL METHODS COMPLETED\n")
+cat(strrep("=", 70), "\n")
+
+# Save results
+saveRDS(all_results, file.path(RESULTS_DIR, "all_comparison_results.rds"))
+``` 
+
+## Comprehensive Results Table
+
+```{r results_table}
+comparison_df <- data.frame(
+  Method = c(
+    "GNN Simple (Ours)",
+    "GNN Attention (Ours)",
+    "GNN Hybrid (Ours)",
+    "XGBoost + Spatial Lag",
+    "Random Forest + KNN",
+    "Dense NN + Aggregated",
+    "Spatial Bayesian (SAR)",
+    "CNN on Maps",
+    "Areal Interpolation (Baseline)"
+  ),
+  MAE = c(
+    all_results$gnn_simple$metrics$mae,
+    all_results$gnn_attention$metrics$mae,
+    all_results$gnn_hybrid$metrics$mae,
+    all_results$xgboost_spatial$metrics$mae,
+    all_results$rf_spatial$metrics$mae,
+    all_results$dense_nn$metrics$mae,
+    all_results$spatial_bayesian$metrics$mae,
+    all_results$cnn_maps$metrics$mae,
+    all_results$areal_interpolation$metrics$mae
+  ),
+  RMSE = c(
+    all_results$gnn_simple$metrics$rmse,
+    all_results$gnn_attention$metrics$rmse,
+    all_results$gnn_hybrid$metrics$rmse,
+    all_results$xgboost_spatial$metrics$rmse,
+    all_results$rf_spatial$metrics$rmse,
+    all_results$dense_nn$metrics$rmse,
+    all_results$spatial_bayesian$metrics$rmse,
+    all_results$cnn_maps$metrics$rmse,
+    all_results$areal_interpolation$metrics$rmse
+  ),
+  R2 = c(
+    all_results$gnn_simple$metrics$r2,
+    all_results$gnn_attention$metrics$r2,
+    all_results$gnn_hybrid$metrics$r2,
+    all_results$xgboost_spatial$metrics$r2,
+    all_results$rf_spatial$metrics$r2,
+    all_results$dense_nn$metrics$r2,
+    all_results$spatial_bayesian$metrics$r2,
+    all_results$cnn_maps$metrics$r2,
+    all_results$areal_interpolation$metrics$r2
+  )
+)
+
+# Calculate improvement over baseline
+baseline_mae <- comparison_df$MAE[comparison_df$Method == "Areal Interpolation (Baseline)"]
+comparison_df$Improvement_vs_Baseline <- 
+  round(100 * (baseline_mae - comparison_df$MAE) / baseline_mae, 1)
+
+# Rank methods
+comparison_df <- comparison_df %>%
+  arrange(MAE) %>%
+  mutate(Rank = row_number())
+
+# Display table
+comparison_table <- comparison_df %>%
+  gt() %>%
+  tab_header(
+    title = "Comprehensive Method Comparison",
+    subtitle = "Electoral Transfer Learning: Old → New Congressional Districts"
+  ) %>%
+  fmt_number(
+    columns = c(MAE, RMSE, R2),
+    decimals = 4
+  ) %>%
+  fmt_number(
+    columns = Improvement_vs_Baseline,
+    decimals = 1,
+    pattern = "{x}%"
+  ) %>%
+  data_color(
+    columns = MAE,
+    palette = "RdYlGn",
+    reverse = TRUE
+  ) %>%
+  data_color(
+    columns = R2,
+    palette = "RdYlGn"
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "lightblue"),
+    locations = cells_body(
+      rows = grepl("Ours", Method)
+    )
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      columns = everything(),
+      rows = Rank == 1
+    )
+  ) %>%
+  tab_footnote(
+    footnote = "Lower MAE/RMSE is better; Higher R² is better",
+    locations = cells_column_labels(columns = c(MAE, RMSE, R2))
+  ) %>%
+  tab_footnote(
+    footnote = "Our methods highlighted in light blue",
+    locations = cells_column_labels(columns = Method)
+  )
+
+comparison_table
+
+# Save table
+gtsave(comparison_table, 
+       filename = file.path(RESULTS_DIR, "tables", "comprehensive_comparison.html"))
+
+# Save as CSV
+write_csv(comparison_df, 
+          file.path(RESULTS_DIR, "tables", "comprehensive_comparison.csv"))
+
+cat("\nComparison table saved.\n")
+```
+
+## Visualization: Method Comparison
+
+```{r comparison_plots, fig.width=14, fig.height=10}
+# 1. Bar chart of MAE by method
+p_mae_comparison <- ggplot(comparison_df, aes(x = reorder(Method, MAE), y = MAE)) +
+  geom_bar(aes(fill = ifelse(grepl("Ours", Method), "Our Method", "Baseline")),
+           stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = sprintf("%.4f", MAE)), 
+            hjust = -0.1, size = 3.5) +
+  scale_fill_manual(values = c("Our Method" = "#2166AC", "Baseline" = "#D73027"),
+                    name = "") +
+  coord_flip() +
+  labs(
+    title = "Mean Absolute Error (MAE) Comparison",
+    subtitle = "Lower is better",
+    x = "Method",
+    y = "Mean Absolute Error"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  )
+
+ggsave(file.path(RESULTS_DIR, "plots", "mae_comparison.pdf"), 
+       p_mae_comparison, width = 12, height = 8)
+
+# 2. Scatter plot: MAE vs R²
+p_mae_r2 <- ggplot(comparison_df, aes(x = MAE, y = R2)) +
+  geom_point(aes(color = ifelse(grepl("Ours", Method), "Our Method", "Baseline"),
+                 size = ifelse(grepl("Ours", Method), 4, 3))) +
+  geom_text(aes(label = gsub(" \\(Ours\\)|\\(Baseline\\)", "", Method)), 
+            vjust = -0.8, size = 3, check_overlap = TRUE) +
+  scale_color_manual(values = c("Our Method" = "#2166AC", "Baseline" = "#D73027"),
+                     name = "") +
+  scale_size_identity() +
+  labs(
+    title = "Method Performance: MAE vs R²",
+    subtitle = "Optimal methods are in bottom-right (low MAE, high R²)",
+    x = "Mean Absolute Error (MAE)",
+    y = "R² Score"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  )
+
+ggsave(file.path(RESULTS_DIR, "plots", "mae_r2_scatter.pdf"), 
+       p_mae_r2, width = 10, height = 8)
+
+# 3. Improvement over baseline
+p_improvement <- comparison_df %>%
+  filter(Method != "Areal Interpolation (Baseline)") %>%
+  ggplot(aes(x = reorder(Method, Improvement_vs_Baseline), 
+             y = Improvement_vs_Baseline)) +
+  geom_bar(aes(fill = ifelse(grepl("Ours", Method), "Our Method", "Baseline")),
+           stat = "identity", alpha = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_text(aes(label = sprintf("%.1f%%", Improvement_vs_Baseline)), 
+            hjust = ifelse(comparison_df$Improvement_vs_Baseline[-9] > 0, -0.1, 1.1), 
+            size = 3.5) +
+  scale_fill_manual(values = c("Our Method" = "#2166AC", "Baseline" = "#D73027"),
+                    name = "") +
+  coord_flip() +
+  labs(
+    title = "Improvement Over Areal Interpolation Baseline",
+    subtitle = "Positive values indicate better performance than baseline",
+    x = "Method",
+    y = "Improvement in MAE (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  )
+
+ggsave(file.path(RESULTS_DIR, "plots", "improvement_over_baseline.pdf"), 
+       p_improvement, width = 12, height = 8)
+
+# 4. Combined metrics comparison
+metrics_long <- comparison_df %>%
+  select(Method, MAE, RMSE, R2) %>%
+  pivot_longer(cols = c(MAE, RMSE, R2), 
+               names_to = "Metric", 
+               values_to = "Value") %>%
+  mutate(
+    Normalized_Value = case_when(
+      Metric %in% c("MAE", "RMSE") ~ 1 - (Value - min(Value)) / (max(Value) - min(Value)),
+      Metric == "R2" ~ (Value - min(Value)) / (max(Value) - min(Value))
+    )
+  )
+
+p_metrics_heatmap <- ggplot(metrics_long, 
+                             aes(x = Metric, y = reorder(Method, -Normalized_Value), 
+                                 fill = Normalized_Value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.3f", Value)), color = "black", size = 3) +
+  scale_fill_gradient2(
+    low = "#D73027", mid = "#FFFFBF", high = "#1A9850",
+    midpoint = 0.5,
+    name = "Normalized\nPerformance"
+  ) +
+  labs(
+    title = "Comprehensive Metrics Heatmap",
+    subtitle = "Normalized performance across all metrics (darker green = better)",
+    x = "Metric",
+    y = "Method"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+ggsave(file.path(RESULTS_DIR, "plots", "metrics_heatmap.pdf"), 
+       p_metrics_heatmap, width = 10, height = 8)
+
+# 5. Create combined panel
+combined_plot <- (p_mae_comparison + p_mae_r2) / (p_improvement + p_metrics_heatmap) +
+  plot_annotation(
+    title = "Comprehensive Method Comparison for Electoral Transfer Learning",
+    subtitle = "Comparing GNN approaches with modern spatial ML methods",
+    theme = theme(plot.title = element_text(size = 16, face = "bold"))
+  )
+
+ggsave(file.path(RESULTS_DIR, "plots", "comprehensive_comparison_panel.pdf"), 
+       combined_plot, width = 18, height = 14)
+
+cat("\nAll comparison visualizations saved.\n")
+```
+
+## Statistical Significance Testing
+
+```{r statistical_tests}
+cat("\n=== Statistical Significance Tests ===\n\n")
+
+# Extract predictions for all methods
+method_names <- c("GNN Hybrid", "XGBoost Spatial", "RF Spatial", 
+                  "Dense NN", "Spatial Bayesian", "CNN Maps", 
+                  "Areal Interpolation")
+
+predictions_list <- list(
+  all_results$gnn_hybrid$predictions,
+  all_results$xgboost_spatial$cv_predictions,
+  all_results$rf_spatial$cv_predictions,
+  all_results$dense_nn$cv_predictions,
+  all_results$spatial_bayesian$cv_predictions,
+  all_results$cnn_maps$cv_predictions,
+  all_results$areal_interpolation$cv_predictions
+)
+
+# Paired t-tests: Compare GNN Hybrid to all others
+cat("Paired t-tests comparing GNN Hybrid to other methods:\n")
+cat(strrep("-", 60), "\n")
+
+pairwise_results <- data.frame(
+  Comparison = character(),
+  Mean_Difference = numeric(),
+  t_statistic = numeric(),
+  p_value = numeric(),
+  Significant = character(),
+  stringsAsFactors = FALSE
+)
+
+gnn_errors <- abs(predictions_list[[1]] - targets)
+
+for(i in 2:length(predictions_list)) {
+  other_errors <- abs(predictions_list[[i]] - targets)
+  
+  t_test <- t.test(gnn_errors, other_errors, paired = TRUE)
+  
+  pairwise_results <- rbind(pairwise_results, data.frame(
+    Comparison = paste("GNN Hybrid vs", method_names[i]),
+    Mean_Difference = mean(gnn_errors - other_errors),
+    t_statistic = t_test$statistic,
+    p_value = t_test$p.value,
+    Significant = ifelse(t_test$p.value < 0.05, "Yes***", 
+                        ifelse(t_test$p.value < 0.10, "Yes*", "No"))
+  ))
+  
+  cat(sprintf("%-40s: t=%.3f, p=%.4f %s\n",
+              paste("GNN Hybrid vs", method_names[i]),
+              t_test$statistic,
+              t_test$p.value,
+              ifelse(t_test$p.value < 0.05, "***", "")))
+}
+
+cat("\n")
+
+# Save test results
+write_csv(pairwise_results, 
+          file.path(RESULTS_DIR, "tables", "statistical_tests.csv"))
+
+# Create significance table
+sig_table <- pairwise_results %>%
+  gt() %>%
+  tab_header(
+    title = "Statistical Significance Tests",
+    subtitle = "Paired t-tests comparing GNN Hybrid to other methods"
+  ) %>%
+  fmt_number(
+    columns = c(Mean_Difference, t_statistic, p_value),
+    decimals = 4
+  ) %>%
+  data_color(
+    columns = p_value,
+    palette = "RdYlGn",
+    reverse = TRUE
+  ) %>%
+  tab_footnote(
+    footnote = "*** p < 0.05, * p < 0.10",
+    locations = cells_column_labels(columns = Significant)
+  )
+
+sig_table
+
+gtsave(sig_table, 
+       filename = file.path(RESULTS_DIR, "tables", "statistical_tests.html"))
+
+cat("Statistical tests completed and saved.\n")
+```

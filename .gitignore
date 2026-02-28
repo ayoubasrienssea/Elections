@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# PyTorch
+*.pth
+*.pt
+checkpoints/
+
+# R
+.Rhistory
+.RData
+.Rapp.history
+*.Rproj.user/
+*.Rproj
+
+# RStudio
+.Rproj.user/
+
+# knitr and R markdown
+*_cache/
+*_files/
+*.utf8.md
+*.knit.md
+
+# LaTeX
+*.aux
+*.log
+*.out
+*.synctex.gz
+*.tex
+
+# OS
+.DS_Store
+Thumbs.db
+*~
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Temporary
+tmp/
+temp/
+*.tmp
